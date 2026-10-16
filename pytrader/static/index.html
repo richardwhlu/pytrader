@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyTrader · Performance Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <div>
+          <div class="brand-name">PyTrader</div>
+          <div class="brand-sub">performance dashboard</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a class="nav-link" href="#new">New Backtest</a>
+        <a class="nav-link" href="#performance">Performance</a>
+        <a class="nav-link" href="#universe">Universe</a>
+      </nav>
+    </aside>
+
+    <main class="main">
+
+      <!-- ===== A. New Backtest ===== -->
+      <section id="new" class="panel" aria-labelledby="new-h">
+        <h2 id="new-h">New Backtest</h2>
+        <form id="backtest-form" novalidate autocomplete="off">
+          <div class="form-grid">
+            <div class="field span2">
+              <label for="f-name">Name <span class="opt">(optional)</span></label>
+              <input id="f-name" name="name" type="text" maxlength="80" placeholder="e.g. mom-v2" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="f-horizon">Horizon (days) <span class="opt">1–60</span></label>
+              <input id="f-horizon" name="horizon" type="number" min="1" max="60" step="1" value="5" inputmode="numeric">
+            </div>
+            <div class="field">
+              <label for="f-topn">Top N <span class="opt">1–50</span></label>
+              <input id="f-topn" name="top_n" type="number" min="1" max="50" step="1" value="5" inputmode="numeric">
+            </div>
+            <div class="field">
+              <label for="f-comm">Commission (bps) <span class="opt">≥ 0</span></label>
+              <input id="f-comm" name="commission_bps" type="number" min="0" step="0.5" value="1" inputmode="decimal">
+            </div>
+            <div class="field">
+              <label for="f-slip">Slippage (bps) <span class="opt">≥ 0</span></label>
+              <input id="f-slip" name="slippage_bps" type="number" min="0" step="0.5" value="5" inputmode="decimal">
+            </div>
+            <div class="field submit-field">
+              <button type="submit" id="backtest-submit" class="btn">Run Backtest</button>
+            </div>
+          </div>
+          <div id="backtest-status" class="inline-status" role="status"></div>
+        </form>
+      </section>
+
+      <!-- ===== B. Performance ===== -->
+      <section id="performance" class="panel" aria-labelledby="perf-h">
+        <h2 id="perf-h">Performance</h2>
+
+        <div id="runs-status" class="inline-status" role="status"></div>
+
+        <div id="runs-table-wrap" class="table-wrap card" aria-hidden="true">
+          <table class="data-table" id="runs-table">
+            <thead>
+              <tr>
+                <th class="col-view"><span class="sr-only">View</span></th>
+                <th>Name</th>
+                <th>Created</th>
+                <th class="num">Days</th>
+                <th class="num">Tickers</th>
+                <th class="num">Sharpe</th>
+                <th class="num">CAGR</th>
+                <th class="num">MaxDD</th>
+                <th class="num">Return</th>
+                <th class="num">AnnVol</th>
+                <th class="num">IR</th>
+              </tr>
+            </thead>
+            <tbody id="runs-tbody"></tbody>
+          </table>
+        </div>
+        <div id="runs-empty" class="empty hidden">No runs yet — kick one off in the panel above.</div>
+
+        <div class="chart-block">
+          <div id="chart-status" class="inline-status" role="status"></div>
+          <div id="chart-box" class="chart-box">
+            <canvas id="equity-chart" role="img" aria-label="Cumulative return chart of selected backtests"></canvas>
+          </div>
+          <div id="chart-empty" class="empty hidden">No runs selected — check some runs below the chart.</div>
+          <div id="chart-legend" class="chart-legend" aria-hidden="true"></div>
+        </div>
+
+        <div id="compare-block" class="hidden">
+          <h3>Metric Comparison</h3>
+          <div class="table-wrap card">
+            <table class="data-table" id="compare-table"></table>
+          </div>
+        </div>
+
+        <div id="detail-block">
+          <h3>Latest Run — <span id="detail-name" class="accent"></span></h3>
+          <div id="detail-status" class="inline-status" role="status"></div>
+          <div id="detail-grid" class="detail-grid hidden"></div>
+        </div>
+      </section>
+
+      <!-- ===== C. Universe ===== -->
+      <section id="universe" class="panel" aria-labelledby="uni-h">
+        <h2 id="uni-h">Universe</h2>
+        <div id="universe-status" class="inline-status" role="status"></div>
+
+        <div class="universe-grid">
+          <div class="card">
+            <h3>Selected <span id="sel-count" class="count-badge hidden"></span></h3>
+            <div class="table-wrap">
+              <table class="data-table" id="selected-table">
+                <thead>
+                  <tr><th>Ticker</th><th>Name</th><th>Sector</th></tr>
+                </thead>
+                <tbody id="selected-tbody"></tbody>
+              </table>
+            </div>
+            <div id="selected-empty" class="empty hidden">No selected holdings.</div>
+          </div>
+
+          <div class="card">
+            <h3>Rejected <span id="rej-count" class="count-badge hidden"></span></h3>
+            <div class="table-wrap">
+              <table class="data-table" id="rejected-table">
+                <thead>
+                  <tr><th>Ticker</th><th>Reasons</th></tr>
+                </thead>
+                <tbody id="rejected-tbody"></tbody>
+              </table>
+            </div>
+            <div id="rejected-empty" class="empty hidden">No rejections — full universe passed.</div>
+          </div>
+        </div>
+
+        <div id="universe-error" class="inline-status err hidden" role="alert"></div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
