@@ -73,6 +73,8 @@ def run_strategy(
     pipeline: PipelineConfig | None = None,
     model_dir: Path | None = None,
     universe: dict[str, dict] | None = None,
+    features: FeatureSpec | None = None,  # your own factor set
+    model: Model | None = None,           # your own learner
 ) -> PipelineResult:
     """Fetch, screen, train, backtest, and (optionally) persist a run."""
     pipeline = pipeline or PipelineConfig.from_config(cfg)
@@ -105,7 +107,7 @@ def run_strategy(
             f"expected {len(tickers)+1} series, got {len(series)} from store"
         )
 
-    spec = FeatureSpec()
+    spec = features or FeatureSpec()
     X, y = compute_panel(series, spec, horizon=pipeline.horizon,
                          benchmark=cfg.benchmark)
     feat_cols = spec.column_names()
@@ -119,7 +121,9 @@ def run_strategy(
     Xtr, ytr = X[tr], y[tr]
     Xva, yva = X[va], y[va]
 
-    model = XGBoostModel(random_state=pipeline.random_state)
+    model = model if model is not None else XGBoostModel(random_state=pipeline.random_state)
+    if not hasattr(model, "feature_names"):
+        raise TypeError("supplied model must implement fit/predict/feature_names")
     model.fit(Xtr[feat_cols], ytr.to_numpy(dtype="float64"))
     scores_train = model.predict(Xtr[feat_cols])
     scores_valid = model.predict(Xva[feat_cols])
@@ -143,7 +147,7 @@ def run_strategy(
     # average turnover from periods
     avg_turn = float(np.mean([p.turnover for p in sim.periods])) if sim.periods else 0.0
     metrics = summarize(
-        sim.equity, sim.dates, sim.benchmark_equity
+        sim.equity, sim.dates, sim.benchmark_equity, periods=sim.periods
     )
     metrics["metrics"]["avg_turnover"] = round(avg_turn, 6)
     metrics["metrics"]["train_ic"] = round(train_ic, 6)
@@ -176,6 +180,10 @@ def run_strategy(
     except Exception:  # noqa: BLE001 — persistence is best-effort for POC
         pass
 
+    _fi = (
+        model.feature_importance()
+        if hasattr(model, "feature_importance") else []
+    )
     res = PipelineResult(
         run_id=run_id,
         name=name,
@@ -183,7 +191,7 @@ def run_strategy(
         config=out_cfg,
         metrics=metrics,
         result=sim,
-        feature_importance=model.feature_importance(),
+        feature_importance=_fi,
     )
 
     if db is not None:

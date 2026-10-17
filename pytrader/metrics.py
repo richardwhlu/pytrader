@@ -1,12 +1,67 @@
-"""Performance metrics from an equity curve (returns already net of costs)."""
+"""Performance metrics from an equity curve (returns already net of costs).
+
+Built-in metrics are pure functions below. To optimize against your own
+metric, either:
+
+  * register it once via ``register_metric`` and it will be computed and
+    stored with every run, or
+  * compute it yourself from ``SimulationResult.periods`` / ``equity`` and
+    pass it through ``summarize(..., custom={name: value})``.
+
+This keeps the metric set open-ended without touching the engine.
+"""
 from __future__ import annotations
 
 import math
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 TRADING_DAYS = 252
+
+# A custom metric is given the equity curve, its dates, and (optionally) the
+# list of holding periods, and returns a single finite float.
+MetricFn = Callable[..., float]
+_CUSTOM: dict[str, MetricFn] = {}
+
+
+def register_metric(name: str, fn: MetricFn | None = None) -> MetricFn:
+    """Register a named custom metric so every run reports it.
+
+    ``fn(equity, dates, periods) -> float``. Supports both styles::
+
+        M.register_metric("max_loss", my_fn)
+        @M.register_metric("max_loss")
+        def my_fn(equity, dates, periods): ...
+
+    Re-registering the same name overwrites it.
+    """
+    if fn is not None:
+        _CUSTOM[name] = fn
+        return fn
+
+    def deco(f: MetricFn) -> MetricFn:
+        _CUSTOM[name] = f
+        return f
+
+    return deco  # type: ignore[return-value]
+
+
+def clear_custom_metrics() -> None:
+    _CUSTOM.clear()
+
+
+def custom_metrics(equity, dates, periods) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for name, fn in _CUSTOM.items():
+        try:
+            v = float(fn(equity, dates, periods))
+            if math.isfinite(v):
+                out[name] = v
+        except Exception:  # noqa: BLE001 — a bad custom metric must not kill a run
+            continue
+    return out
 
 
 def total_return(equity: pd.Series | np.ndarray) -> float:
@@ -100,8 +155,19 @@ def summarize(
     equity: pd.Series,
     dates: pd.DatetimeIndex | None = None,
     benchmark_equity: pd.Series | None = None,
+    periods: "Sequence[object] | None" = None,
+    custom: Mapping[str, float] | None = None,
 ) -> dict[str, dict[str, float]]:
-    """One-stop metric block for a run."""
+    """One-stop metric block for a run.
+
+    Registered custom metrics (see ``register_metric``) are always computed
+    from ``(equity, dates, periods)`` and folded into ``metrics``. ``custom``
+    lets a caller supply pre-computed values, overriding same-named entries.
+    """
+    merged_custom = dict(custom_metrics(equity, dates, periods))
+    if custom:
+        merged_custom.update({k: float(v) for k, v in custom.items() if math.isfinite(float(v))})
+
     eq = np.asarray(equity, dtype="float64")
     rets = np.diff(eq) / eq[:-1]
     out: dict[str, float] = {
@@ -114,6 +180,7 @@ def summarize(
         "hit_rate": hit_rate(rets),
         "n_days": int(len(eq) - 1),
     }
+    out.update(merged_custom)
     bench: dict[str, float] = {}
     if benchmark_equity is not None and len(benchmark_equity) > 1:
         beq = np.asarray(benchmark_equity, dtype="float64")
