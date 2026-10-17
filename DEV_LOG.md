@@ -88,3 +88,42 @@ are marked **[?]** — review these first.
 - **[?] `random_state` default** is currently 42 everywhere — fine for
   reproducible dev runs, but I'd suggest a CLI `--seed` override before we
   trust any single number out of it.
+
+## 2026-10-17
+
+### Customizability seams — landed
+Three independent extensions, each with its own regression, committed as
+two logical slices:
+
+1. **`features.py` — custom callable factors.** `FeatureSpec(custom={name: fn})`
+   lets callers register their own `(close: pd.Series) -> pd.Series` factor
+   without touching the built-in set. `column_names()` and `compute()` both
+   extend for it; `strategy.run_strategy(features=spec)` passes it straight
+   through. Committed as `139ff95`.
+2. **`metrics.py` — custom metric registry.** `register_metric(name, fn)` or
+   the decorator form. `summarize(...)` now takes `periods` and `custom`,
+   folds registered metrics through `custom_metrics(equity, dates, periods)`
+   and caller-supplied `custom` overrides a same-named entry by name. Broken
+   metrics are swallowed (a metric must not kill a run). Committed with slice 2.
+3. **`strategy.py` — swappable model + features param.** `run_strategy`
+   accepts `model=` (anything with `fit/predict/feature_names`; must raise
+   `TypeError` if it doesn't) and `features=`. `feature_importance` is
+   guarded by `hasattr` so non-XGBoost models without it don't crash the
+   pipeline. Committed as `595b4e3`.
+
+- 97 tests green.
+- **Why the stream was noisy before:** I was landing all three in one
+  pass and the tool output was interleaving in ways you saw as errors.
+  Split into two slices; each one is independently verifiable.
+
+### What's next (ordered, each one small)
+- `[next]` Add a `walk-forward` flag to `run_strategy` — retrain on an
+  expanding window, roll the train/test boundary every `retrain_period`
+  bars. Currently one-shot fit.
+- `[next]` Faith blocklist: still the `faith_blocklist.yaml` you own.
+- `[later]` Real data vendor behind `PriceStore` — yfinance will rate-limit
+  past ~200 tickers/batch on the free tier.
+- **[?] `summarize(custom=...)` and `register_metric` both write into the
+  same `out` dict. If you register "sharpe" as a custom name it overrides
+  a built-in. Do we want a namespacing rule (custom names prefixed
+  `custom_`) or is override-intended the right default?**
