@@ -52,3 +52,48 @@ def test_upsert_replaces(tmp_db, tmp_path):
     got = tmp_db.get_run("x")
     assert got.metrics == {"sharpe": 2}
     assert tmp_db.list_runs() and len(tmp_db.list_runs()) == 1
+
+
+def test_equity_index_roundtrips_across_resolutions(tmp_db):
+    """Save frames at both ns and µs resolution; read-back must match."""
+    # ns resolution (classic pandas default)
+    ns_idx = pd.bdate_range("2025-01-02", periods=10).as_unit("ns")
+    assert str(ns_idx.dtype).endswith("[ns]")
+    eq_ns = pd.Series(np.linspace(1, 2, 10), index=ns_idx)
+    bench_ns = pd.Series(np.linspace(1, 1.5, 10), index=ns_idx)
+    df_ns = pd.DataFrame({
+        "equity": eq_ns.to_numpy(),
+        "benchmark_equity": bench_ns.to_numpy(),
+    }, index=ns_idx)
+    tmp_db.save_run(RunRecord("ns", "ns", "t", {}, {}), df_ns)
+    o1 = tmp_db.get_equity("ns")
+    assert o1.index[0] == ns_idx[0]
+    assert o1.index[-1] == ns_idx[-1]
+    assert o1["equity"].tolist() == pytest.approx(
+        np.linspace(1, 2, 10).tolist(), rel=1e-9
+    )
+
+    # microsecond resolution (new pandas default in 3.x)
+    us_idx = pd.bdate_range("2025-01-02", periods=6).as_unit("us")
+    assert str(us_idx.dtype).endswith("[us]")
+    df_us = pd.DataFrame({
+        "equity": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+        "benchmark_equity": None,
+    }, index=us_idx)
+    tmp_db.save_run(RunRecord("us", "us", "t", {}, {}), df_us)
+    o2 = tmp_db.get_equity("us")
+    assert o2.index[0] == us_idx[0]
+    assert o2.index[-1] == us_idx[-1]
+    assert o2["equity"].tolist() == [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+
+
+def test_equity_index_sort_after_roundtrip(tmp_db):
+    """If the incoming frame is unordered, the read-back must be ordered."""
+    idx = pd.bdate_range("2025-01-02", periods=6)
+    eq = pd.DataFrame({"equity": [1, 2, 3, 4, 5, 6], "benchmark_equity": None})
+    eq.index = idx
+    # reverse the row order before saving
+    eq_rev = eq.iloc[::-1]
+    tmp_db.save_run(RunRecord("r", "r", "t", {}, {}), eq_rev)
+    o = tmp_db.get_equity("r")
+    assert o.index.is_monotonic_increasing

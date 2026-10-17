@@ -195,7 +195,7 @@ def run_strategy(
                 else np.full(len(sim.equity), np.nan)
             ),
         })
-        eq = eq.set_index(pd.DatetimeIndex(sim.dates).asi8 // 10**9)
+        eq = eq.set_index(pd.DatetimeIndex(sim.dates))
         import json as _json
         rec = RunRecord(
             run_id=run_id, name=name, created_at=created_at,

@@ -91,7 +91,7 @@ class DuckDBStore(DB):
         rows = [
             (rec.run_id, int(ts), float(eq), float(bench) if pd.notna(bench) else None)
             for ts, eq, bench in zip(
-                equity.index.astype("int64"),
+                equity.index.as_unit("ns").asi8,
                 equity["equity"].astype("float64"),
                 equity["benchmark_equity"].astype("float64"),
             )
@@ -129,7 +129,8 @@ class DuckDBStore(DB):
         if not rows:
             return None
         df = pd.DataFrame(rows, columns=["ts", "equity", "benchmark_equity"])
-        return df.set_index("ts")
+        df["ts"] = pd.to_datetime(df["ts"], unit="ns")
+        return df.set_index("ts").sort_index()
 
     def close(self) -> None:
         try:

@@ -19,12 +19,25 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 
 from pytrader.config import Config
-from pytrader.data import make_store
-from pytrader.storage import DuckDBStore
+from pytrader.data import make_store, PriceStore
+from pytrader.storage import DB, DuckDBStore
 from pytrader.strategy import PipelineConfig, run_strategy
 
 
-def create_app(cfg: Config | None = None) -> Flask:
+def create_app(
+    cfg: Config | None = None,
+    store: PriceStore | None = None,
+    db: DB | None = None,
+    db_path: str | Path | None = None,
+) -> Flask:
+    """Create the Flask app.
+
+    Injection points for tests / future platform changes:
+      * ``cfg``    — user config (defaults to ``Config.load()``)
+      * ``store``  — price data source (defaults to yfinance)
+      * ``db``     — run repository (defaults to DuckDB under .pytrader/)
+      * ``db_path``— alternate location for the DuckDB store
+    """
     static = Path(__file__).parent / "static"
     app = Flask(
         __name__,
@@ -32,8 +45,10 @@ def create_app(cfg: Config | None = None) -> Flask:
         static_url_path="/static",
     )
     cfg = cfg or Config.load()
-    store = make_store("yfinance")
-    db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
+    store = store or make_store("yfinance")
+    if db is None:
+        p = Path(db_path) if db_path else (Path(".pytrader") / "pytrader.duckdb")
+        db = DuckDBStore(p)
 
     @app.get("/")
     def index():  # type: ignore[return]
@@ -104,9 +119,9 @@ def create_app(cfg: Config | None = None) -> Flask:
         if eq is None:
             return jsonify({"error": "run found but no equity data"}), 500
         eq_list = [
-            [int(ts), float(eq.loc[(ts,), "equity"][0]),
-             None if pd.isna(eq.loc[(ts,), "benchmark_equity"][0])
-             else float(eq.loc[(ts,), "benchmark_equity"][0])]
+            [int(ts.timestamp() * 1000),
+             _f("equity", eq, ts),
+             _f("benchmark_equity", eq, ts)]
             for ts in eq.index
         ]
         return jsonify({
@@ -132,9 +147,14 @@ def create_app(cfg: Config | None = None) -> Flask:
             eq = db.get_equity(rid)
             if eq is None:
                 continue
-            equity = [[int(ts), _f("equity", eq, ts)] for ts in eq.index]
-            bench = [[int(ts), _f("benchmark_equity", eq, ts)]
-                     for ts in eq.index if _f("benchmark_equity", eq, ts) is not None]
+            equity = [
+                [int(ts.timestamp() * 1000), _f("equity", eq, ts)]
+                for ts in eq.index
+            ]
+            bench = [
+                [int(ts.timestamp() * 1000), _f("benchmark_equity", eq, ts)]
+                for ts in eq.index if _f("benchmark_equity", eq, ts) is not None
+            ]
             m = r.metrics.get("metrics", r.metrics)
             out.append({
                 "run_id": rid, "name": r.name, "created_at": r.created_at,
@@ -150,11 +170,25 @@ def create_app(cfg: Config | None = None) -> Flask:
     def backtest():
         body = request.get_json(silent=True) or {}
         base = PipelineConfig.from_config(cfg)
+        # explicit validation with a helpful error message
+        try:
+            horizon = int(body.get("horizon", base.horizon))
+            top_n = int(body.get("top_n", base.top_n))
+            commission_bps = float(body.get("commission_bps", base.commission_bps))
+            slippage_bps = float(body.get("slippage_bps", base.slippage_bps))
+        except (TypeError, ValueError) as e:
+            return jsonify({"error": f"invalid numeric parameter: {e}"}), 400
+        if horizon < 1:
+            return jsonify({"error": "horizon must be >= 1"}), 400
+        if top_n < 1:
+            return jsonify({"error": "top_n must be >= 1"}), 400
+        if commission_bps < 0 or slippage_bps < 0:
+            return jsonify({"error": "costs must be non-negative"}), 400
         p = PipelineConfig(
-            horizon=int(body.get("horizon", base.horizon)),
-            top_n=int(body.get("top_n", base.top_n)),
-            commission_bps=float(body.get("commission_bps", base.commission_bps)),
-            slippage_bps=float(body.get("slippage_bps", base.slippage_bps)),
+            horizon=horizon,
+            top_n=top_n,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
             train_fraction=base.train_fraction,
             random_state=base.random_state,
         )
@@ -180,8 +214,8 @@ def _resolve(cand: dict, cfg: Config):
 
 
 def _f(col: str, eq: pd.DataFrame, ts):
-    v = eq.loc[(ts,), col].iloc[0]
-    if pd.isna(v):
+    v = eq.at[ts, col]
+    if v is None or pd.isna(v):
         return None
     return float(v)
 
