@@ -22,6 +22,23 @@ class DailyPrice:
     index: pd.DatetimeIndex
     close: pd.Series  # float64, aligned to index
 
+    def __post_init__(self) -> None:
+        # Canonicalize to a tz-naive, date-only, ascending DatetimeIndex so
+        # downstream code (features, backtest, storage) never has to care
+        # whether a source handed us exchange-local tz-aware daily stamps.
+        idx = pd.DatetimeIndex(self.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)          # keep local wall-clock day
+        norm = idx.normalize()                   # snap to that day's date
+
+        # Align close to the original index, then collapse any timestamps that
+        # land on the same calendar day, keeping the first close value.
+        close = pd.Series(self.close.to_numpy(dtype="float64"), index=norm)
+        close = close[~close.index.duplicated(keep="first")]
+        close = close[close.notna()].sort_index()
+        self.index = close.index
+        self.close = close
+
     @property
     def start(self) -> pd.Timestamp:
         return self.index[0]

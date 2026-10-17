@@ -20,6 +20,48 @@ class Model(Protocol):
     def feature_names(self) -> list[str]: ...
 
 
+class _QuietFit:
+    """Silence a block by pointing stdout and stderr fds at /dev/null.
+
+    xgboost's native eval-metrics logger writes to the C-level stdout (fd 1)
+    in current releases (older builds used fd 2), and ignores Python's
+    ``verbosity`` setting for these lines. Pointing both fds at devnull is
+    the reliable way to keep ``fit`` quiet; we also restore them on
+    exception via context-manager ``__exit__``.
+    """
+
+    def __init__(self, enabled: bool = True) -> None:
+        self._enabled = enabled
+        self._saved: dict[int, int] = {}
+
+    def __enter__(self) -> "_QuietFit":
+        if not self._enabled:
+            return self
+        import os
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            for fd in (1, 2):
+                try:
+                    self._saved[fd] = os.dup(fd)
+                    os.dup2(devnull, fd)
+                except OSError:
+                    # best-effort; don't break the fit
+                    pass
+        finally:
+            os.close(devnull)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        import os
+        for fd in sorted(self._saved, reverse=True):
+            try:
+                os.dup2(self._saved[fd], fd)
+                os.close(self._saved[fd])
+            except OSError:
+                pass
+            self._saved.pop(fd, None)
+
+
 class XGBoostModel:
     def __init__(
         self,
@@ -31,7 +73,9 @@ class XGBoostModel:
         reg_lambda: float = 1.0,
         random_state: int = 42,
         early_stopping_rounds: int | None = 50,
+        verbose: bool = False,
     ) -> None:
+        self.verbose = verbose
         self.params = dict(
             n_estimators=n_estimators,
             max_depth=max_depth,
@@ -54,9 +98,10 @@ class XGBoostModel:
         if self.early_stopping_rounds is not None:
             kwargs["early_stopping_rounds"] = self.early_stopping_rounds
             eval_set = [(X, y)]
-        self._booster = xgb.XGBRegressor(objective="reg:squarederror", **kwargs).fit(
-            X, y, eval_set=eval_set
-        )
+        with _QuietFit(enabled=not self.verbose):
+            self._booster = xgb.XGBRegressor(objective="reg:squarederror", **kwargs).fit(
+                X, y, eval_set=eval_set
+            )
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
