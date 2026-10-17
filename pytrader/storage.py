@@ -132,4 +132,7 @@ class DuckDBStore(DB):
         return df.set_index("ts")
 
     def close(self) -> None:
-        self._con.close()
+        try:
+            self._con.close()
+        except Exception:  # noqa: BLE001 - already closed in tests/cleanup
+            pass

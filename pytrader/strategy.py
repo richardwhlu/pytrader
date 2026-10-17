@@ -125,11 +125,6 @@ def run_strategy(
     scores_valid = model.predict(Xva[feat_cols])
     train_ic = _pearson(scores_train, ytr.to_numpy())
     valid_ic = _pearson(scores_valid, yva.to_numpy())
-
-    # Score *all* valid dates (train + valid) and let the backtest simulator
-    # walk decision dates forward with no gap (walk-forward-ish: model is
-    # static, but the split proves generalization). For live use, retrain
-    # here on a schedule — the module boundary makes that a 2-line change.
     allmask = y.notna()
     Xall = X[allmask]
     yall = y[allmask]
@@ -159,7 +154,7 @@ def run_strategy(
             "information_ratio", 0.0))
 
     run_id = _make_run_id()
-    created_at = pd.Timestamp.utcnow().isoformat(timespec="seconds").replace(
+    created_at = pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
     out_cfg = dict(pipeline.to_dict())
@@ -222,5 +217,5 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _make_run_id() -> str:
-    ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
     return f"{ts}_{uuid.uuid4().hex[:6]}"

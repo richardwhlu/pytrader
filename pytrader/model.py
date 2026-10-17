@@ -64,6 +64,10 @@ class XGBoostModel:
             raise RuntimeError("model not fit")
         return self._booster.predict(X)
 
+    def feature_names(self) -> list[str]:
+        """Feature order used at fit — stable for callers that reload a model."""
+        return list(self._features)
+
     def feature_importance(self) -> list[tuple[str, float]]:
         if self._booster is None:
             return []
