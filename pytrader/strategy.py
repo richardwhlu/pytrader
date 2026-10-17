@@ -214,6 +214,67 @@ def run_strategy(
     return res
 
 
+def walk_forward_predict(
+    X: pd.DataFrame,
+    feat_cols: list[str],
+    model_factory: "Callable[[], Model]",
+    min_train_rows: int,
+    retrain_every: int = 1,
+) -> tuple[pd.DataFrame, list[tuple[pd.Timestamp, float]]]:
+    """Anchored walk-forward over a ``(date, ticker, ...features..., y)`` panel.
+
+    Pure — no I/O, no XGBoost import required. Caller supplies the model
+    factory (so any ``Model`` learner works) and the feature column list.
+    Walks the date axis in ``retrain_every`` steps starting at the first
+    date *after* ``min_train_rows`` of training data have closed. Each fold
+    fits a fresh model on the expanding window strictly before the fold
+    date (no look-ahead) and predicts on that fold's own rows.
+
+    Returns ``(preds, folds)``. ``preds`` is one wide row per fold date
+    in the same shape ``predictions_from_panel`` produces. ``folds`` is
+    ``[(fold_date, in_sample_ic), ...]`` in date order.
+    """
+    d = pd.Index(pd.to_datetime(X["date"]).unique()).sort_values()
+    if d.size == 0:
+        raise ValueError("walk-forward: panel has no dates")
+    per_date = (
+        X.groupby(pd.to_datetime(X["date"])).size().reindex(d).fillna(0).astype("int64")
+    )
+    running = per_date.to_numpy().cumsum()
+    if int(running[-1]) < min_train_rows:
+        raise ValueError(
+            f"panel has only {int(running[-1])} rows, need >= {min_train_rows}"
+        )
+    # First index whose closed window holds enough rows; folds start one date later.
+    start = int(np.searchsorted(running, min_train_rows, side="left")) + 1
+    if start >= d.size:
+        raise ValueError("not enough dated rows to open a single fold")
+
+    step = max(1, retrain_every)
+    wide: list[pd.DataFrame] = []
+    fold_stats: list[tuple[pd.Timestamp, float]] = []
+    for k in range(start, d.size, step):
+        fold_dt = pd.Timestamp(d[k])
+        tr = X[X["date"] < fold_dt]
+        va = X[X["date"] == fold_dt]
+        if len(tr) < min_train_rows or len(va) == 0:
+            continue
+        model = model_factory()
+        y_tr = tr["y"].to_numpy(dtype="float64")
+        model.fit(tr[feat_cols], y_tr)
+        ic_train = _pearson(model.predict(tr[feat_cols]), y_tr)
+        scores = np.asarray(model.predict(va[feat_cols]), dtype="float64")
+        long = pd.DataFrame({"date": va["date"].to_numpy(),
+                             "ticker": va["ticker"].to_numpy()})
+        wide.append(predictions_from_panel(long, scores))
+        fold_stats.append((fold_dt, float(ic_train)))
+    if not wide:
+        raise ValueError("walk-forward produced no folds; lower min_train_rows")
+    out = pd.concat(wide, ignore_index=False)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out, fold_stats
+
+
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype="float64")
     b = np.asarray(b, dtype="float64")
