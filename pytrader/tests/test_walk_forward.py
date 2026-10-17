@@ -71,8 +71,9 @@ def test_fold_count_and_no_lookahead():
             return super().fit(X, y)
 
     factory = lambda: _Spy()
-    preds, folds = walk_forward_predict(X, ["f"], factory,
-                                        min_train_rows=10, retrain_every=1)
+    preds, folds, models = walk_forward_predict(
+        X, ["f"], factory, min_train_rows=10, retrain_every=1
+    )
     assert len(folds) >= 5
     dates = [dt for dt, _ in folds]
     assert dates == sorted(dates), "folds must be in date order"
@@ -99,10 +100,10 @@ def test_fold_count_and_no_lookahead():
 
 def test_retrain_every_thins_folds():
     X = _make_panel(n_dates=30, n_tickers=5)
-    _, dense = walk_forward_predict(X, ["f"], lambda: _LinearFit(),
-                                    min_train_rows=10, retrain_every=1)
-    _, sparse = walk_forward_predict(X, ["f"], lambda: _LinearFit(),
-                                     min_train_rows=10, retrain_every=3)
+    _, dense, _ = walk_forward_predict(X, ["f"], lambda: _LinearFit(),
+                                       min_train_rows=10, retrain_every=1)
+    _, sparse, _ = walk_forward_predict(X, ["f"], lambda: _LinearFit(),
+                                        min_train_rows=10, retrain_every=3)
     assert len(sparse) < len(dense)
     # Same starting date as dense (min_train_rows unchanged).
     assert sparse[0][0] == dense[0][0]
@@ -110,8 +111,10 @@ def test_retrain_every_thins_folds():
 
 def test_output_shape_matches_predictions_from_panel():
     X = _make_panel(n_dates=30, n_tickers=5)
-    preds, folds = walk_forward_predict(X, ["f"], lambda: _LinearFit(),
-                                        min_train_rows=10, retrain_every=1)
+    preds, folds, models = walk_forward_predict(
+        X, ["f"], lambda: _LinearFit(), min_train_rows=10, retrain_every=1
+    )
+    assert len(models) == len(folds), "one trained model per fold"
     # One row per fold, one column per ticker, index is DatetimeIndex.
     assert isinstance(preds.index, pd.DatetimeIndex)
     assert set(preds.columns) == {"T0", "T1", "T2", "T3", "T4"}

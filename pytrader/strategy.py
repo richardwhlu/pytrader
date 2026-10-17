@@ -75,6 +75,9 @@ def run_strategy(
     universe: dict[str, dict] | None = None,
     features: FeatureSpec | None = None,  # your own factor set
     model: Model | None = None,           # your own learner
+    *,
+    walk_forward: bool = False,           # anchored walk-forward (off → one-shot)
+    retrain_every: int = 1,               # one fold per calendar step
 ) -> PipelineResult:
     """Fetch, screen, train, backtest, and (optionally) persist a run."""
     pipeline = pipeline or PipelineConfig.from_config(cfg)
@@ -112,29 +115,60 @@ def run_strategy(
                          benchmark=cfg.benchmark)
     feat_cols = spec.column_names()
 
-    dates = X["date"].sort_values().unique()
-    cut = dates[max(1, int(round(len(dates) * pipeline.train_fraction)))]
-    tr = (X["date"] <= cut) & y.notna()
-    va = (X["date"] > cut) & y.notna()
-    if tr.sum() < 50:
-        raise ValueError(f"train set too small: {int(tr.sum())} rows")
-    Xtr, ytr = X[tr], y[tr]
-    Xva, yva = X[va], y[va]
+    # Panel with `y` column visible — walk_forward_predict needs it there.
+    X_full = X.copy()
+    X_full["y"] = y.to_numpy()
 
-    model = model if model is not None else XGBoostModel(random_state=pipeline.random_state)
-    if not hasattr(model, "feature_names"):
-        raise TypeError("supplied model must implement fit/predict/feature_names")
-    model.fit(Xtr[feat_cols], ytr.to_numpy(dtype="float64"))
-    scores_train = model.predict(Xtr[feat_cols])
-    scores_valid = model.predict(Xva[feat_cols])
-    train_ic = _pearson(scores_train, ytr.to_numpy())
-    valid_ic = _pearson(scores_valid, yva.to_numpy())
-    allmask = y.notna()
-    Xall = X[allmask]
-    yall = y[allmask]
-    scores_all = model.predict(Xall[feat_cols])
-    preds = predictions_from_panel(Xall, scores_all)
-    preds = preds[(preds.index > pd.Timestamp(cut))]  # decision dates post-split
+    # Model factory: walk-forward fits a fresh model per fold; the
+    # one-shot path fits exactly once.
+    if model is None:
+        def _model_factory() -> Model:
+            return XGBoostModel(random_state=pipeline.random_state)
+    else:
+        # User-supplied model: same object returned each fold; caller can
+        # inspect it after `run_strategy` returns to get the final state.
+        _model_factory = lambda: model  # type: ignore[return-value]
+
+    model_obj: Model | None = None   # bound below in whichever path runs
+    wf_meta: dict = {}               # populated only when walk_forward is on
+
+    if walk_forward:
+        min_train_rows = max(10, int(round(len(X_full) * pipeline.train_fraction)))
+        preds, wf_folds, wf_models = walk_forward_predict(
+            X_full, feat_cols, _model_factory,
+            min_train_rows=min_train_rows,
+            retrain_every=retrain_every,
+        )
+        train_ic = float(np.mean([ic for _dt, ic in wf_folds])) if wf_folds else 0.0
+        valid_ic = float(train_ic)  # walk-forward has no out-of-fold split
+        preds = preds[(preds.index > wf_folds[0][0])] if wf_folds else preds
+        model_obj = wf_models[-1] if wf_models else None
+        wf_meta = {"walk_forward": True, "n_folds": len(wf_models),
+                   "retrain_every": int(retrain_every),
+                   "min_train_rows": int(min_train_rows)}
+    else:
+        dates = X_full["date"].sort_values().unique()
+        cut = dates[max(1, int(round(len(dates) * pipeline.train_fraction)))]
+        tr = (X_full["date"] <= cut) & X_full["y"].notna()
+        va = (X_full["date"] > cut) & X_full["y"].notna()
+        if tr.sum() < 50:
+            raise ValueError(f"train set too small: {int(tr.sum())} rows")
+        Xtr, ytr = X_full[tr], X_full["y"][tr]
+        Xva, yva = X_full[va], X_full["y"][va]
+
+        model = _model_factory()
+        if not hasattr(model, "feature_names"):
+            raise TypeError("supplied model must implement fit/predict/feature_names")
+        model.fit(Xtr[feat_cols], ytr.to_numpy(dtype="float64"))
+        model_obj = model  # for later save / feature_importance
+        scores_train = model.predict(Xtr[feat_cols])
+        scores_valid = model.predict(Xva[feat_cols])
+        train_ic = _pearson(scores_train, ytr.to_numpy())
+        valid_ic = _pearson(scores_valid, yva.to_numpy())
+        Xall = X_full[X_full["y"].notna()]
+        scores_all = model.predict(Xall[feat_cols])
+        preds = predictions_from_panel(Xall, scores_all)
+        preds = preds[(preds.index > pd.Timestamp(cut))]
 
     bt = BacktestConfig(
         horizon=pipeline.horizon,
@@ -172,17 +206,20 @@ def run_strategy(
         ][:20],
         "feature_set": feat_cols + ["horizon", "top_n"],
     })
+    if wf_meta:
+        out_cfg.update(wf_meta)
 
     model_dir = model_dir or (Path(".pytrader") / "models" / run_id)
     try:
-        model.save(model_dir, meta={"train_ic": train_ic, "valid_ic": valid_ic,
-                                   "run_id": run_id})
+        if model_obj is not None and hasattr(model_obj, "save"):
+            model_obj.save(model_dir, meta={"train_ic": train_ic, "valid_ic": valid_ic,
+                                            "run_id": run_id})
     except Exception:  # noqa: BLE001 — persistence is best-effort for POC
         pass
 
     _fi = (
-        model.feature_importance()
-        if hasattr(model, "feature_importance") else []
+        model_obj.feature_importance()
+        if model_obj is not None and hasattr(model_obj, "feature_importance") else []
     )
     res = PipelineResult(
         run_id=run_id,
@@ -220,7 +257,7 @@ def walk_forward_predict(
     model_factory: "Callable[[], Model]",
     min_train_rows: int,
     retrain_every: int = 1,
-) -> tuple[pd.DataFrame, list[tuple[pd.Timestamp, float]]]:
+) -> tuple[pd.DataFrame, list[tuple[pd.Timestamp, float]], list[Model]]:
     """Anchored walk-forward over a ``(date, ticker, ...features..., y)`` panel.
 
     Pure — no I/O, no XGBoost import required. Caller supplies the model
@@ -230,33 +267,43 @@ def walk_forward_predict(
     fits a fresh model on the expanding window strictly before the fold
     date (no look-ahead) and predicts on that fold's own rows.
 
-    Returns ``(preds, folds)``. ``preds`` is one wide row per fold date
-    in the same shape ``predictions_from_panel`` produces. ``folds`` is
-    ``[(fold_date, in_sample_ic), ...]`` in date order.
+    Returns ``(preds, folds, models)``. ``preds`` is one wide row per fold
+    date in the same shape ``predictions_from_panel`` produces. ``folds``
+    is ``[(fold_date, in_sample_ic), ...]`` in date order. ``models`` is
+    the list of trained models (one per fold, in date order) so the
+    caller can persist the final one.
     """
     d = pd.Index(pd.to_datetime(X["date"]).unique()).sort_values()
     if d.size == 0:
         raise ValueError("walk-forward: panel has no dates")
+    valid = X["y"].notna()
+    # Only labelled rows count toward the min-train budget (trailing rows
+    # in a panel have y=NaN because there is no forward window).
     per_date = (
-        X.groupby(pd.to_datetime(X["date"])).size().reindex(d).fillna(0).astype("int64")
+        X[valid]
+        .groupby(pd.to_datetime(X[valid]["date"])).size()
+        .reindex(d).fillna(0).astype("int64")
     )
     running = per_date.to_numpy().cumsum()
     if int(running[-1]) < min_train_rows:
         raise ValueError(
-            f"panel has only {int(running[-1])} rows, need >= {min_train_rows}"
+            f"panel has only {int(running[-1])} labelled rows, need >= {min_train_rows}"
         )
-    # First index whose closed window holds enough rows; folds start one date later.
+    # First fold is one date after the first whose closed window holds
+    # at least min_train_rows labelled rows (so that fold's training set
+    # closes at that boundary and excludes its own rows).
     start = int(np.searchsorted(running, min_train_rows, side="left")) + 1
     if start >= d.size:
-        raise ValueError("not enough dated rows to open a single fold")
+        raise ValueError("not enough labelled dated rows to open a single fold")
 
     step = max(1, retrain_every)
     wide: list[pd.DataFrame] = []
     fold_stats: list[tuple[pd.Timestamp, float]] = []
+    trained: list[Model] = []
     for k in range(start, d.size, step):
         fold_dt = pd.Timestamp(d[k])
-        tr = X[X["date"] < fold_dt]
-        va = X[X["date"] == fold_dt]
+        tr = X[(X["date"] < fold_dt) & valid]
+        va = X[(X["date"] == fold_dt) & valid]
         if len(tr) < min_train_rows or len(va) == 0:
             continue
         model = model_factory()
@@ -268,11 +315,12 @@ def walk_forward_predict(
                              "ticker": va["ticker"].to_numpy()})
         wide.append(predictions_from_panel(long, scores))
         fold_stats.append((fold_dt, float(ic_train)))
+        trained.append(model)
     if not wide:
         raise ValueError("walk-forward produced no folds; lower min_train_rows")
     out = pd.concat(wide, ignore_index=False)
     out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out, fold_stats
+    return out, fold_stats, trained
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
