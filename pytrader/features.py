@@ -48,12 +48,18 @@ def trend(close: pd.Series, window: int) -> pd.Series:
 
 @dataclass
 class FeatureSpec:
-    """Which factors to compute; extend freely."""
+    """Which factors to compute; extend freely.
+
+    ``custom`` maps a factor name to a callable ``(close: pd.Series) ->
+    pd.Series`` — register your own features here without touching this
+    module, e.g. ``FeatureSpec(custom={"bb_width": lambda c: ...})``.
+    """
 
     momentum_windows: list[int] = None  # type: ignore[assignment]
     vol_windows: list[int] = None  # type: ignore[assignment]
     rsi: int = 14
     trend_windows: list[int] = None  # type: ignore[assignment]
+    custom: dict | None = None
 
     def __post_init__(self) -> None:
         if self.momentum_windows is None:
@@ -72,6 +78,8 @@ class FeatureSpec:
         cols.append(f"rsi_{self.rsi}")
         for w in self.trend_windows:
             cols.append(f"trend_{w}")
+        if self.custom:
+            cols.extend(self.custom.keys())
         return cols
 
     def compute(self, close: pd.Series) -> pd.DataFrame:
@@ -83,6 +91,9 @@ class FeatureSpec:
         df[f"rsi_{self.rsi}"] = rsi(close, self.rsi)
         for w in self.trend_windows:
             df[f"trend_{w}"] = trend(close, w)
+        if self.custom:
+            for name, fn in self.custom.items():
+                df[name] = fn(close)
         return df
 
 
