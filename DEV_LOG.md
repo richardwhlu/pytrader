@@ -117,9 +117,11 @@ two logical slices:
   Split into two slices; each one is independently verifiable.
 
 ### What's next (ordered, each one small)
-- `[next]` Add a `walk-forward` flag to `run_strategy` — retrain on an
-  expanding window, roll the train/test boundary every `retrain_period`
-  bars. Currently one-shot fit.
+- `[done]` `walk-forward` flag on `run_strategy`: `run_strategy(...,
+  walk_forward=True, retrain_every=5)`. The pure function
+  `pytrader.strategy.walk_forward_predict` is independently testable
+  (no-leak, fold growth, NaN-y exclusion). `min_train_rows` is derived
+  from `train_fraction`, no new config surface. Committed `77f1299`.
 - `[next]` Faith blocklist: still the `faith_blocklist.yaml` you own.
 - `[later]` Real data vendor behind `PriceStore` — yfinance will rate-limit
   past ~200 tickers/batch on the free tier.
@@ -127,3 +129,7 @@ two logical slices:
   same `out` dict. If you register "sharpe" as a custom name it overrides
   a built-in. Do we want a namespacing rule (custom names prefixed
   `custom_`) or is override-intended the right default?**
+- **[? Walk-forward `valid_ic`:** currently `valid_ic = train_ic` because
+  there is no out-of-fold split by design. Should I add a proper
+  `valid_ic` (e.g. the fold's *next-step* IC as a sanity check) or
+  replace `valid_ic` with a `fold_ic` series in the result? **]
