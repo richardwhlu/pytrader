@@ -93,7 +93,44 @@ class PriceStorage(abc.ABC):
     def save_meta(self, ticker: str, meta: dict[str, str]) -> None: ...
 
 
-class DuckDBStore(DB, PriceStorage):
+class FeatureStorage(abc.ABC):
+    """Point-in-time feature cache.
+
+    Long form: one row per (ticker, as_of, feature_name). A `spec_hash`
+    scopes rows by the `FeatureSpec` that produced them, so different
+    specs coexist in one table. Time-travel is a point query:
+    `query(ticker, as_of, spec_hash)` returns that ticker's feature values
+    on that date.
+
+    Point-in-time guarantee: a row written for (ticker, D) was computed
+    from prices ≤ D — features are trailing/rolling windows, so the store
+    never contains a label that used future prices.
+    """
+
+    @abc.abstractmethod
+    def upsert_panel(self, ticker: str, spec_hash: str,
+                     panel: pd.DataFrame) -> int:
+        """Bulk-write one ticker's feature panel (columns: date + features).
+
+        Replaces all existing rows for (ticker, spec_hash). Returns the
+        number of rows written.
+        """
+
+    @abc.abstractmethod
+    def query(self, ticker: str, as_of: pd.Timestamp,
+              spec_hash: str) -> dict[str, float] | None:
+        """Feature values for a single (ticker, date). None if absent."""
+
+    @abc.abstractmethod
+    def dates(self, ticker: str, spec_hash: str) -> list[pd.Timestamp]:
+        """All dated feature rows for a ticker under a spec, ascending."""
+
+    @abc.abstractmethod
+    def spec_features(self, spec_hash: str) -> list[str]:
+        """Distinct feature names present under a spec hash (sorted)."""
+
+
+class DuckDBStore(DB, PriceStorage, FeatureStorage):
     def __init__(self, path: Path | str = ".pytrader/pytrader.duckdb") -> None:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +176,15 @@ class DuckDBStore(DB, PriceStorage):
               ticker VARCHAR PRIMARY KEY,
               name   VARCHAR,
               sector VARCHAR
+            )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS feature_store(
+              ticker    VARCHAR NOT NULL,
+              as_of     DATE NOT NULL,
+              spec_hash VARCHAR NOT NULL,
+              feature   VARCHAR NOT NULL,
+              value     DOUBLE,
+              PRIMARY KEY(ticker, as_of, spec_hash, feature)
             )""")
 
     def save_run(self, rec: RunRecord, equity: pd.DataFrame) -> None:
@@ -255,3 +301,66 @@ class DuckDBStore(DB, PriceStorage):
             "ON CONFLICT(ticker) DO UPDATE SET name = EXCLUDED.name, sector = EXCLUDED.sector",
             [ticker, str(meta.get("name", ticker)), str(meta.get("sector", ""))],
         )
+
+    # ----------------------------------------------------------------
+    # FeatureStorage
+    # ----------------------------------------------------------------
+
+    def upsert_panel(self, ticker: str, spec_hash: str,
+                     panel: pd.DataFrame) -> int:
+        if panel is None or len(panel) == 0:
+            return 0
+        feat_cols = [c for c in panel.columns if c not in ("date", "ticker")]
+        if not feat_cols:
+            return 0
+        rows: list[tuple] = []
+        date_series = (
+            panel["date"] if "date" in panel.columns
+            else (panel.index if isinstance(panel.index, pd.DatetimeIndex)
+                  else pd.to_datetime(panel.index))
+        )
+        dates = pd.DatetimeIndex(pd.to_datetime(date_series))
+        values = panel[feat_cols].to_numpy(dtype="float64")
+        for i in range(len(dates)):
+            d = dates[i].date()
+            for j, name in enumerate(feat_cols):
+                v = float(values[i, j])
+                rows.append((ticker, d, spec_hash, name, v if v == v else None))
+        self._con.executemany(
+            "INSERT INTO feature_store(ticker, as_of, spec_hash, feature, value) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(ticker, as_of, spec_hash, feature) "
+            "DO UPDATE SET value = EXCLUDED.value",
+            rows,
+        )
+        return len(rows)
+
+    def query(self, ticker: str, as_of: pd.Timestamp,
+              spec_hash: str) -> dict[str, float] | None:
+        d = pd.Timestamp(as_of).normalize().date()
+        rows = self._con.execute(
+            "SELECT feature, value FROM feature_store "
+            "WHERE ticker=? AND as_of=? AND spec_hash=?",
+            [ticker, d, spec_hash],
+        ).fetchall()
+        if not rows:
+            return None
+        out: dict[str, float] = {}
+        for name, v in rows:
+            out[name] = None if v is None else float(v)
+        return out
+
+    def dates(self, ticker: str, spec_hash: str) -> list[pd.Timestamp]:
+        rows = self._con.execute(
+            "SELECT DISTINCT as_of FROM feature_store "
+            "WHERE ticker=? AND spec_hash=? ORDER BY as_of",
+            [ticker, spec_hash],
+        ).fetchall()
+        return [pd.Timestamp(r[0]) for r in rows]
+
+    def spec_features(self, spec_hash: str) -> list[str]:
+        rows = self._con.execute(
+            "SELECT DISTINCT feature FROM feature_store WHERE spec_hash=? "
+            "ORDER BY feature", [spec_hash]
+        ).fetchall()
+        return [r[0] for r in rows]

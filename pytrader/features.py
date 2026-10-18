@@ -96,6 +96,28 @@ class FeatureSpec:
                 df[name] = fn(close)
         return df
 
+    def spec_hash(self) -> str:
+        """Stable identifier for the *shape* of this spec.
+
+        Identical specs (same windows, RSI, custom factor names) hash the
+        same, so they share one partition in the feature store. Custom
+        factor *values* are keyed by name only — the store can't hash a
+        callable — so two specs whose custom functions differ in behavior
+        but share a name will collide. That is by design: the name is the
+        feature's identity in the matrix.
+        """
+        import hashlib
+        import json
+        custom = sorted(self.custom.keys()) if self.custom else []
+        payload = json.dumps({
+            "m": sorted(self.momentum_windows),
+            "v": sorted(self.vol_windows),
+            "r": int(self.rsi),
+            "t": sorted(self.trend_windows),
+            "c": custom,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
 
 def future_return(close: pd.Series, horizon: int) -> pd.Series:
     """Label: log return `horizon` days ahead (NaN at the end)."""
