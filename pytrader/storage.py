@@ -311,29 +311,33 @@ class DuckDBStore(DB, PriceStorage, FeatureStorage):
         if panel is None or len(panel) == 0:
             return 0
         feat_cols = [c for c in panel.columns if c not in ("date", "ticker")]
-        if not feat_cols:
+        if not feat_cols or "date" not in panel.columns:
             return 0
-        rows: list[tuple] = []
-        date_series = (
-            panel["date"] if "date" in panel.columns
-            else (panel.index if isinstance(panel.index, pd.DatetimeIndex)
-                  else pd.to_datetime(panel.index))
+        # Isolate the rows we'll persist (dropping fully-missing feature rows).
+        wide = panel.loc[:, ["date", *feat_cols]].dropna(how="all").copy()
+        if len(wide) == 0:
+            return 0
+        # Wide → long: one row per (date, feature). Stack with `date` as index
+        # yields columns [date, feature, value].
+        long = (
+            wide.set_index("date")
+            .stack()
+            .reset_index(name="value")
+            .rename(columns={"level_1": "feature"})
         )
-        dates = pd.DatetimeIndex(pd.to_datetime(date_series))
-        values = panel[feat_cols].to_numpy(dtype="float64")
-        for i in range(len(dates)):
-            d = dates[i].date()
-            for j, name in enumerate(feat_cols):
-                v = float(values[i, j])
-                rows.append((ticker, d, spec_hash, name, v if v == v else None))
-        self._con.executemany(
+        long["value"] = pd.to_numeric(long["value"], errors="coerce").astype("float64")
+        long.insert(0, "ticker", ticker.upper())
+        long.insert(1, "h", spec_hash)
+        long["as_of"] = pd.to_datetime(long["date"]).dt.date
+        df = long[["ticker", "as_of", "h", "feature", "value"]]
+        # One bulk statement — far faster than a per-cell executemany.
+        self._con.execute(
             "INSERT INTO feature_store(ticker, as_of, spec_hash, feature, value) "
-            "VALUES (?,?,?,?,?) "
+            "SELECT ticker, as_of, h, feature, value FROM df "
             "ON CONFLICT(ticker, as_of, spec_hash, feature) "
             "DO UPDATE SET value = EXCLUDED.value",
-            rows,
         )
-        return len(rows)
+        return int(len(df))
 
     def query(self, ticker: str, as_of: pd.Timestamp,
               spec_hash: str) -> dict[str, float] | None:

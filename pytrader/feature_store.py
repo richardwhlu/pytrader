@@ -30,6 +30,39 @@ class FeatureStore:
     def has(self, ticker: str, spec: FeatureSpec) -> bool:
         return self._storage.spec_features(self._hash(spec)) != []
 
+    def save_panel(self, ticker: str, spec: FeatureSpec,
+                   panel: pd.DataFrame) -> int:
+        """Persist an already-computed (date, feature...) panel for a ticker.
+
+        No recompute — the caller (e.g. `run_strategy`) hands us the exact
+        matrix it trained on, so the cache and the model can never drift.
+        """
+        return self._storage.upsert_panel(ticker.upper(), self._hash(spec), panel)
+
+    def load_panel(self, ticker: str, spec: FeatureSpec) -> pd.DataFrame | None:
+        """Read a stored panel back (wide: date + feature columns).
+
+        Returns None if the ticker/spec-hash has nothing cached. This is
+        the time-travel read: any historical (ticker, date) is retrievable
+        without touching prices again.
+        """
+        feats = self._storage.spec_features(self._hash(spec))
+        if not feats:
+            return None
+        dates = self._storage.dates(ticker.upper(), self._hash(spec))
+        if not dates:
+            return None
+        rows = []
+        for d in dates:
+            rec = self._storage.query(ticker.upper(), d, self._hash(spec)) or {}
+            row = {"date": d}
+            for f in feats:
+                row[f] = rec.get(f)
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True)
+
     def build(self, series: DailyPrice, spec: FeatureSpec) -> pd.DataFrame:
         """Compute features for one ticker and persist them.
 

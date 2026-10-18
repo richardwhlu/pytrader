@@ -28,6 +28,7 @@ from pytrader.metrics import summarize
 from pytrader.model import XGBoostModel
 from pytrader.storage import DB, RunRecord
 from pytrader.universe import resolve_universe
+from pytrader.feature_store import FeatureStore
 
 
 @dataclass
@@ -75,6 +76,7 @@ def run_strategy(
     universe: dict[str, dict] | None = None,
     features: FeatureSpec | None = None,  # your own factor set
     model: Model | None = None,           # your own learner
+    feature_store: "FeatureStore | None" = None,  # populate the PT feature cache
     *,
     task: str = "regression",             # "regression" | "binary"
     walk_forward: bool = False,           # anchored walk-forward (off → one-shot)
@@ -123,6 +125,19 @@ def run_strategy(
     X, y = compute_panel(series, spec, horizon=pipeline.horizon,
                          benchmark=cfg.benchmark, label_kind=label_kind)
     feat_cols = spec.column_names()
+
+    # Persist the features we're about to train on into the point-in-time
+    # store (task 2). We store the *exact* matrix the model will fit —
+    # no recomputation from cache, so cache and model cannot drift.
+    if feature_store is not None:
+        for t in tickers:
+            sub = X[X["ticker"].astype(str).str.upper() == t.upper()]
+            if len(sub) == 0:
+                continue
+            panel = sub[["date", "ticker", *feat_cols]].dropna(subset=feat_cols)
+            if len(panel) == 0:
+                continue
+            feature_store.save_panel(t, spec, panel)
 
     # Panel with `y` column visible — walk_forward_predict needs it there.
     X_full = X.copy()

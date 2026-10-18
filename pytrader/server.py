@@ -20,6 +20,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from pytrader.config import Config
 from pytrader.data import make_store, PriceStore
+from pytrader.feature_store import FeatureStore
 from pytrader.storage import DB, DuckDBStore
 from pytrader.strategy import PipelineConfig, run_strategy
 
@@ -197,7 +198,10 @@ def create_app(
         )
         name = str(body.get("name", "")).strip() or f"run-{p.run_id if hasattr(p, 'run_id') else 'inline'}"
         try:
-            res = run_strategy(store, cfg, db=db, name=name, pipeline=p)
+            from pytrader.storage import FeatureStorage as _FS
+            fs = FeatureStore(db) if isinstance(db, _FS) else None
+            res = run_strategy(store, cfg, db=db, name=name, pipeline=p,
+                               feature_store=fs)
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": str(e)}), 400
         return jsonify({
@@ -238,7 +242,8 @@ def run_backtest_cli(name: str = "cli-run") -> None:
     db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
     store = make_store("yfinance", cache=db)
     p = PipelineConfig.from_config(cfg)
-    res = run_strategy(store, cfg, db=db, name=name, pipeline=p)
+    res = run_strategy(store, cfg, db=db, name=name, pipeline=p,
+                       feature_store=FeatureStore(db))
     print(f"run_id     : {res.run_id}")
     print(f"name       : {res.name}")
     print(f"created_at : {res.created_at}")
