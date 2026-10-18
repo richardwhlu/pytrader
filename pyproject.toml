@@ -23,6 +23,7 @@ dev = [
 [project.scripts]
 pytrader-serve = "pytrader.cli:main"
 pytrader-backtest = "pytrader.cli:run_backtest_cli"
+pytrader-download = "pytrader.cli:run_download_cli"
 
 [tool.pytest.ini_options]
 testpaths = ["pytrader/tests"]

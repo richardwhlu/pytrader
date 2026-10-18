@@ -31,5 +31,64 @@ def run_backtest_cli() -> None:
     _impl(name=args.name)
 
 
+def run_download_cli() -> None:
+    """Collect a universe into the local price cache (rate-limited).
+
+    Example:
+      pytrader-download --tickers NVDA,MSFT,GOOG,AAPL,AMD,INTC \
+          --lookback-years 5 --batch-size 25
+    """
+    parser = argparse.ArgumentParser(prog="pytrader-download")
+    parser.add_argument("--config", default=None,
+                        help="yaml path; universe defaults to the config include list")
+    parser.add_argument("--tickers", default=None,
+                        help="comma-separated tickers (overrides the config include list)")
+    parser.add_argument("--benchmark", default="SPY",
+                        help="always include this series as the benchmark")
+    parser.add_argument("--lookback-years", type=float, default=5.0)
+    parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument("--pause-seconds", type=float, default=1.0)
+    parser.add_argument("--overwrite", action="store_true",
+                        help="re-fetch tickers already in the cache")
+    args = parser.parse_args()
+
+    from datetime import date, timedelta
+    from pathlib import Path
+    from pytrader.config import Config
+    from pytrader.data import batch_download
+    from pytrader.storage import DuckDBStore
+
+    cfg = None
+    if args.config:
+        import yaml
+        cfg = Config.from_dict(yaml.safe_load(Path(args.config).read_text()))
+    cfg = cfg or Config.default()
+
+    tickers = (
+        [t.strip() for t in args.tickers.split(",") if t.strip()]
+        if args.tickers else list(cfg.include)
+    )
+    if args.benchmark and args.benchmark.upper() not in [t.upper() for t in tickers]:
+        tickers = [args.benchmark, *tickers]
+
+    db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
+    start = date.today() - timedelta(days=int(args.lookback_years * 365.25))
+
+    from pytrader.data import YFinanceStore
+    upstream = YFinanceStore()
+    summary = batch_download(
+        upstream, db, tickers, start,
+        batch_size=args.batch_size, pause_seconds=args.pause_seconds,
+        overwrite=args.overwrite,
+    )
+    print(f"fetched : {summary['n_fetched']:>4}")
+    if summary["fetched"]:
+        print("          " + ", ".join(summary["fetched"]))
+    print(f"cached  : {summary['n_cached']:>4}  already present")
+    print(f"failed  : {summary['n_failed']:>4}")
+    if summary["failed"]:
+        print("          " + ", ".join(summary["failed"]))
+
+
 if __name__ == "__main__":
     main()

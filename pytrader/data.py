@@ -227,3 +227,64 @@ def make_store(
     if cache is not None:
         return CachedPriceStore(raw, cache)  # type: ignore[arg-type]
     return raw
+
+
+def batch_download(
+    upstream: PriceStore,
+    cache: "PriceStorage",
+    tickers: list[str],
+    start: date,
+    *,
+    batch_size: int = 25,
+    pause_seconds: float = 1.0,
+    overwrite: bool = False,
+) -> dict:
+    """Bulk-load a universe into the price cache with rate limiting.
+
+    Fetches in `batch_size` chunks, pausing `pause_seconds` between
+    chunks, so a large universe (hundreds of tickers) is collected without
+    tripping Yahoo's per-IP limit. Tickers already in the cache are skipped
+    (unless `overwrite`), which makes re-runs cheap and idempotent — the
+    first run pays the full network cost, subsequent runs only fill gaps.
+
+    Returns a summary dict: {fetched, cached_skip, failed,
+    n_fetched, n_cached, n_failed}.
+    """
+    if batch_size < 1:
+        batch_size = 1
+    fetched: list[str] = []
+    cached_skip: list[str] = []
+    failed: list[str] = []
+    import time as _time
+
+    # Partition: cached (skip) vs todo (fetch).
+    todo: list[str] = []
+    for t in tickers:
+        tu = t.upper()
+        if not overwrite and cache.end_date(tu) is not None:
+            cached_skip.append(tu)
+        else:
+            todo.append(tu)
+
+    for i in range(0, len(todo), batch_size):
+        chunk = todo[i:i + batch_size]
+        if i > 0 and pause_seconds > 0:
+            _time.sleep(pause_seconds)
+        for t in chunk:
+            try:
+                series = upstream.fetch([t], start)
+                for s in series:
+                    cache.save(s.ticker, s.close)
+                meta = upstream.metadata([t]).get(t, {"name": t, "sector": ""})
+                cache.save_meta(t, meta)
+                fetched.append(t)
+            except Exception:  # noqa: BLE001 — one bad ticker must not kill the batch
+                failed.append(t)
+    return {
+        "fetched": fetched,
+        "cached_skip": cached_skip,
+        "failed": failed,
+        "n_fetched": len(fetched),
+        "n_cached": len(cached_skip),
+        "n_failed": len(failed),
+    }
