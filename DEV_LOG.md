@@ -122,14 +122,65 @@ two logical slices:
   `pytrader.strategy.walk_forward_predict` is independently testable
   (no-leak, fold growth, NaN-y exclusion). `min_train_rows` is derived
   from `train_fraction`, no new config surface. Committed `77f1299`.
+- `[done]` Data + feature store + binary task — see the later
+  **2026-10-17** section (tasks 1–5): price cache, point-in-time feature
+  store, `task="binary"` predictor, run wiring, and `pytrader-download`.
 - `[next]` Faith blocklist: still the `faith_blocklist.yaml` you own.
-- `[later]` Real data vendor behind `PriceStore` — yfinance will rate-limit
-  past ~200 tickers/batch on the free tier.
 - **[?] `summarize(custom=...)` and `register_metric` both write into the
   same `out` dict. If you register "sharpe" as a custom name it overrides
   a built-in. Do we want a namespacing rule (custom names prefixed
   `custom_`) or is override-intended the right default?**
 - **[? Walk-forward `valid_ic`:** currently `valid_ic = train_ic` because
-  there is no out-of-fold split by design. Should I add a proper
-  `valid_ic` (e.g. the fold's *next-step* IC as a sanity check) or
-  replace `valid_ic` with a `fold_ic` series in the result? **]
+  there is no out-of-fold split by design. Add a proper `valid_ic`
+  (fold's *next-step* IC as a sanity check) or a `fold_ic` series in the
+  result? **]
+- **[?] Binary 6-month horizon:** the binary task uses `pipeline.horizon`
+  as the "ahead" window. To mean "6 months" set `horizon=126` (≈6 trading
+  months) when calling. Do we want a named preset
+  (`task="binary_6m"`) or is raw `horizon=126` clearer? **]
+## 2026-10-17 — Data + feature store + binary task (tasks 1–5)
+
+The owner asked to: collect real data, generate features, build a
+lightweight **time-travel feature store**, start training, and add a
+coarse **"will this be up in 6 months"** binary prediction (smooths macro
+shocks, more robust than raw RMSE on noisy daily labels). Began on the
+question of whether the yfinance *free budget* (per-IP rate limit, not a
+hard 200/batch cap) needed orchestrating. All five tasks landed, each
+committed and verified independently. **127 tests green (up from 97).**
+
+| # | Task | What shipped | Commit |
+|---|------|--------------|--------|
+| 1 | Price cache | `PriceStorage` ABC; `DuckDBStore` implements it; `CachedPriceStore` decorator serves from cache, hits upstream only on miss (or stale if `refresh_after_days` set). 2nd+ run = pure cache read → rate-limit safe. | `312b62e` |
+| 2 | Feature store | `feature_store` table (long: ticker, as_of, spec_hash, feature, value); `FeatureSpec.spec_hash()` scopes partitions; `FeatureStore.save/load/query` → point-in-time reads. | `35bb612` |
+| 3 | Binary task | `binary_updown` label; `XGBoostBinaryModel` (P(up) output); `roc_auc` + `precision_at_k` (rank-based, no deps); `run_strategy(task="binary")` reports AUC + top-K precision instead of IC. | `8365ba2` |
+| 4 | Wiring | `run_strategy(feature_store=...)` persists the *exact* trained matrix (no drift); `upsert_panel` rewritten as one bulk `INSERT…SELECT` (was per-cell → 17ms now). Server + CLI populate the store. | `fcf682b` |
+| 5 | Batch download | `batch_download()` chunked rate-limited loader; `pytrader-download` CLI. Idempotent: cached tickers skipped, failures reported not raised. | `b9547b6` |
+
+### How the pieces compose (the workflow you asked for)
+```
+pytrader-download --tickers NVDA,MSFT,... --lookback-years 5   # task 5: cache prices
+    → runs populate price cache (task 1)
+run_strategy(..., feature_store=FeatureStore(db))               # task 4: fill feature store
+    → point-in-time features (task 2), retrievable for any historical date
+run_strategy(..., task="binary")                                 # task 3: up/down predictor
+    → reports AUC + P@k, backtest unchanged (scores still "higher = more likely up")
+```
+
+### Design notes / decisions
+- **Binary `predict()` returns P(up), not a 0/1 class.** The top-N backtest
+  picks "highest score" → "most likely to rise" still holds, so the
+  regression and binary tasks share one backtest engine. IC is reported as
+  0.0 on the binary task (uninformative on a 0/1 target) — the meaningful
+  stats (AUC, top-K precision) are reported separately.
+- **`spec_hash` collision caveat:** two specs whose custom factors *share a
+  name but differ in behavior* collide in the store (we can't hash a
+  callable). Documented on `FeatureSpec.spec_hash()`.
+- **NaN feature rows are kept as NULL in the store**, but `run_strategy`
+  drops NaN rows before `save_panel`, so the cached matrix is the one the
+  model actually trained on.
+
+### Open (unchanged from earlier)
+- `[next]` Faith blocklist — `faith_blocklist.yaml` owner-owned.
+- **[?] Custom metric namespacing** (`"sharpe"` override vs `custom_` prefix).
+- **[?] Walk-forward `valid_ic`** = `train_ic` today; proper holdout or a
+  per-fold IC series?
