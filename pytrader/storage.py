@@ -1,11 +1,22 @@
 """Persistence layer.
 
-`DB` is the interface. `DuckDBStore` is the local implementation; a
-PostgresStore can implement the same interface later. Tables:
+`DB` is the interface for run records. `DuckDBStore` is the local
+implementation; a PostgresStore can implement the same interface later.
+
+Tables:
 
   runs(run_id PK, name, created_at, config_json, metrics_json)
   run_equity(run_id, ts, equity, benchmark_equity)
   models(model_id PK, run_id, artifact_path, feature_names_json, created_at)
+  market_prices(ticker, as_of, close)      -- raw price cache
+  price_meta(ticker PK, name, sector)      -- cached ticker metadata
+
+`PriceStorage` is the abstract interface the price cache implements:
+  load_prices(tickers, start) -> list[(ticker, pd.Series)]
+  save_prices(ticker, pd.Series) -> None
+  latest_date(ticker) -> pd.Timestamp | None
+  load_meta(ticker) -> dict | None
+  save_meta(ticker, dict) -> None
 """
 from __future__ import annotations
 
@@ -47,7 +58,42 @@ class DB(abc.ABC):
     def close(self) -> None: ...
 
 
-class DuckDBStore(DB):
+class PriceStorage(abc.ABC):
+    """Raw price cache — separate from the run-record DB on purpose.
+
+    Methods:
+      end_date(ticker)          -> pd.Timestamp | None
+                                   Date of the last cached close, or None.
+                                   `CachedPriceStore` uses this to decide
+                                   whether to hit upstream.
+      load(ticker)              -> pd.Series
+                                   Cached close (full history since first
+                                   save). Caller slices to `start` if needed.
+      save(ticker, close)       -> None
+                                   Upsert (INSERT OR REPLACE on
+                                   (ticker, date)); callers can refresh
+                                   stale series by re-saving.
+      load_meta(ticker)         -> dict[str, str] | None
+      save_meta(ticker, meta)   -> None
+    """
+
+    @abc.abstractmethod
+    def end_date(self, ticker: str) -> pd.Timestamp | None: ...
+
+    @abc.abstractmethod
+    def load(self, ticker: str) -> pd.Series: ...
+
+    @abc.abstractmethod
+    def save(self, ticker: str, close: pd.Series) -> None: ...
+
+    @abc.abstractmethod
+    def load_meta(self, ticker: str) -> dict[str, str] | None: ...
+
+    @abc.abstractmethod
+    def save_meta(self, ticker: str, meta: dict[str, str]) -> None: ...
+
+
+class DuckDBStore(DB, PriceStorage):
     def __init__(self, path: Path | str = ".pytrader/pytrader.duckdb") -> None:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +126,19 @@ class DuckDBStore(DB):
               artifact_path VARCHAR NOT NULL,
               feature_names_json VARCHAR,
               created_at VARCHAR
+            )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS market_prices(
+              ticker VARCHAR NOT NULL,
+              as_of  DATE NOT NULL,
+              close  DOUBLE NOT NULL,
+              PRIMARY KEY(ticker, as_of)
+            )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS price_meta(
+              ticker VARCHAR PRIMARY KEY,
+              name   VARCHAR,
+              sector VARCHAR
             )""")
 
     def save_run(self, rec: RunRecord, equity: pd.DataFrame) -> None:
@@ -137,3 +196,62 @@ class DuckDBStore(DB):
             self._con.close()
         except Exception:  # noqa: BLE001 - already closed in tests/cleanup
             pass
+
+    # ----------------------------------------------------------------
+    # PriceStorage
+    # ----------------------------------------------------------------
+
+    def end_date(self, ticker: str) -> pd.Timestamp | None:
+        row = self._con.execute(
+            "SELECT MAX(as_of) FROM market_prices WHERE ticker=?",
+            [ticker],
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return pd.Timestamp(row[0]).normalize()
+
+    def load(self, ticker: str) -> pd.Series:
+        rows = self._con.execute(
+            "SELECT as_of, close FROM market_prices WHERE ticker=? ORDER BY as_of",
+            [ticker],
+        ).fetchall()
+        if not rows:
+            return pd.Series(dtype="float64")
+        s = pd.Series([r[1] for r in rows],
+                      index=pd.DatetimeIndex([r[0] for r in rows]),
+                      dtype="float64")
+        s.index.name = None
+        return s
+
+    def save(self, ticker: str, close: pd.Series) -> None:
+        if len(close) == 0:
+            return
+        idx = pd.DatetimeIndex(close.index)
+        rows = [
+            (ticker, d.date(), float(v))
+            for d, v in zip(idx, close.to_numpy(dtype="float64"))
+            if not (v != v)  # NaN guard
+        ]
+        if not rows:
+            return
+        self._con.executemany(
+            "INSERT INTO market_prices(ticker, as_of, close) "
+            "VALUES (?,?,?) "
+            "ON CONFLICT(ticker, as_of) DO UPDATE SET close = EXCLUDED.close",
+            rows,
+        )
+
+    def load_meta(self, ticker: str) -> dict[str, str] | None:
+        row = self._con.execute(
+            "SELECT name, sector FROM price_meta WHERE ticker=?", [ticker]
+        ).fetchone()
+        if row is None:
+            return None
+        return {"name": row[0] or ticker, "sector": row[1] or ""}
+
+    def save_meta(self, ticker: str, meta: dict[str, str]) -> None:
+        self._con.execute(
+            "INSERT INTO price_meta(ticker, name, sector) VALUES (?,?,?) "
+            "ON CONFLICT(ticker) DO UPDATE SET name = EXCLUDED.name, sector = EXCLUDED.sector",
+            [ticker, str(meta.get("name", ticker)), str(meta.get("sector", ""))],
+        )

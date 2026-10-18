@@ -45,10 +45,13 @@ def create_app(
         static_url_path="/static",
     )
     cfg = cfg or Config.load()
-    store = store or make_store("yfinance")
     if db is None:
         p = Path(db_path) if db_path else (Path(".pytrader") / "pytrader.duckdb")
         db = DuckDBStore(p)
+    if store is None:
+        # Wire the price cache over yfinance so repeated runs are cache reads,
+        # not network calls. `db` doubles as PriceStorage.
+        store = make_store("yfinance", cache=db)
 
     @app.get("/")
     def index():  # type: ignore[return]
@@ -232,8 +235,8 @@ main = run_cli
 def run_backtest_cli(name: str = "cli-run") -> None:
     """One-shot CLI backtest using default config + data (yfinance)."""
     cfg = Config.load()
-    store = make_store("yfinance")
     db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
+    store = make_store("yfinance", cache=db)
     p = PipelineConfig.from_config(cfg)
     res = run_strategy(store, cfg, db=db, name=name, pipeline=p)
     print(f"run_id     : {res.run_id}")

@@ -10,8 +10,12 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 from datetime import date
+from typing import TYPE_CHECKING
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from pytrader.storage import PriceStorage
 
 
 @dataclass
@@ -74,6 +78,81 @@ class DataUnavailable(RuntimeError):
     pass
 
 
+class CachedPriceStore(PriceStore):
+    """Decorator: serve prices from a `PriceStorage` cache, hitting
+    `upstream` only when we don't already have the ticker.
+
+    The stale-refresh heuristic is opt-in (`refresh_after_days`). The
+    default (today) is "cache is authoritative" — once a ticker is in the
+    cache we never fetch it again until the process restarts. That is the
+    rate-limit-safe behavior we want: the first run pays the network cost,
+    every subsequent run is a pure cache read.
+
+    Tests wire this over `InMemoryStore` so cache hits/misses are
+    observable with zero network calls.
+    """
+
+    def __init__(
+        self,
+        upstream: PriceStore,
+        cache: "PriceStorage",
+        refresh_after_days: int | None = None,
+    ) -> None:
+        self._upstream = upstream
+        self._cache = cache
+        self._refresh_after_days = refresh_after_days
+
+    def fetch(self, tickers: list[str], start: date) -> list[DailyPrice]:
+        out: list[DailyPrice] = []
+        for t in tickers:
+            end = self._cache.end_date(t)
+            if end is None:
+                # Never cached — fetch full window from upstream and persist.
+                for series in self._upstream.fetch([t], start):
+                    self._cache.save(series.ticker, series.close)
+                    out.append(series)
+                continue
+            cached = self._cache.load(t)
+            needs_refresh = (
+                self._refresh_after_days is not None
+                and (pd.Timestamp(date.today()).normalize() - end).days
+                    >= self._refresh_after_days
+            )
+            if needs_refresh:
+                try:
+                    for series in self._upstream.fetch(
+                        [t], pd.Timestamp(end).to_pydatetime()
+                    ):
+                        self._cache.save(series.ticker, series.close)
+                    cached = self._cache.load(t)
+                except DataUnavailable:
+                    # Upstream refused; serve what we have rather than fail.
+                    pass
+            start_ts = pd.Timestamp(start)
+            if start_ts > cached.index[0]:
+                idx = cached.index[cached.index >= start_ts]
+                cached = cached.loc[idx]
+            out.append(DailyPrice(t.upper(), cached.index, cached))
+        return out
+
+    def metadata(self, tickers: list[str]) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for t in tickers:
+            cached = self._cache.load_meta(t.upper())
+            if cached is not None:
+                out[t.upper()] = cached
+                continue
+            try:
+                upstream = self._upstream.metadata([t])[t.upper()]
+            except Exception:  # noqa: BLE001 — metadata is best-effort
+                upstream = {"name": t, "sector": ""}
+            self._cache.save_meta(t.upper(), upstream)
+            out[t.upper()] = upstream
+        return out
+
+
+
+
 class YFinanceStore(PriceStore):
     """yfinance-backed PriceStore with a small retry on transient failures."""
 
@@ -134,8 +213,17 @@ class YFinanceStore(PriceStore):
         return out
 
 
-def make_store(kind: str = "yfinance", **kw: object) -> PriceStore:
-    """Factory so the backend can be swapped from config without imports elsewhere."""
+def make_store(
+    kind: str = "yfinance",
+    cache: object | None = None,
+    **kw: object,
+) -> PriceStore:
+    """Factory. When `cache` is a `PriceStorage`, wraps the raw store in a
+    `CachedPriceStore` so repeated runs hit the cache instead of the network."""
     if kind == "yfinance":
-        return YFinanceStore(**kw)  # type: ignore[arg-type]
-    raise ValueError(f"unknown price store kind: {kind!r}")
+        raw: PriceStore = YFinanceStore(**kw)  # type: ignore[arg-type]
+    else:
+        raise ValueError(f"unknown price store kind: {kind!r}")
+    if cache is not None:
+        return CachedPriceStore(raw, cache)  # type: ignore[arg-type]
+    return raw
