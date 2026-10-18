@@ -76,10 +76,18 @@ def run_strategy(
     features: FeatureSpec | None = None,  # your own factor set
     model: Model | None = None,           # your own learner
     *,
+    task: str = "regression",             # "regression" | "binary"
     walk_forward: bool = False,           # anchored walk-forward (off → one-shot)
     retrain_every: int = 1,               # one fold per calendar step
 ) -> PipelineResult:
-    """Fetch, screen, train, backtest, and (optionally) persist a run."""
+    """Fetch, screen, train, backtest, and (optionally) persist a run.
+
+    ``task``:
+      * ``"regression"`` (default) — predict the horizon log return.
+      * ``"binary"`` — predict "close higher ``horizon`` ahead" (0/1).
+        The model outputs P(up); top-N selection still means "most likely
+        to rise". This is the coarse, macro-robust signal requested above.
+    """
     pipeline = pipeline or PipelineConfig.from_config(cfg)
 
     candidates = list(cfg.include) if cfg.include else (list(universe.keys()) if universe else [])
@@ -111,18 +119,21 @@ def run_strategy(
         )
 
     spec = features or FeatureSpec()
+    label_kind = "binary" if task == "binary" else "regression"
     X, y = compute_panel(series, spec, horizon=pipeline.horizon,
-                         benchmark=cfg.benchmark)
+                         benchmark=cfg.benchmark, label_kind=label_kind)
     feat_cols = spec.column_names()
 
     # Panel with `y` column visible — walk_forward_predict needs it there.
     X_full = X.copy()
     X_full["y"] = y.to_numpy()
 
-    # Model factory: walk-forward fits a fresh model per fold; the
-    # one-shot path fits exactly once.
+    # Model factory. The task picks the learner; `model=` overrides.
     if model is None:
         def _model_factory() -> Model:
+            if task == "binary":
+                from pytrader.model import XGBoostBinaryModel
+                return XGBoostBinaryModel(random_state=pipeline.random_state)
             return XGBoostModel(random_state=pipeline.random_state)
     else:
         # User-supplied model: same object returned each fold; caller can
@@ -131,6 +142,9 @@ def run_strategy(
 
     model_obj: Model | None = None   # bound below in whichever path runs
     wf_meta: dict = {}               # populated only when walk_forward is on
+    train_ic: float = 0.0            # IC only meaningful for the regression task
+    valid_ic: float = 0.0
+    binary_stats: dict = {}          # populated for the binary task
 
     if walk_forward:
         min_train_rows = max(10, int(round(len(X_full) * pipeline.train_fraction)))
@@ -163,8 +177,24 @@ def run_strategy(
         model_obj = model  # for later save / feature_importance
         scores_train = model.predict(Xtr[feat_cols])
         scores_valid = model.predict(Xva[feat_cols])
-        train_ic = _pearson(scores_train, ytr.to_numpy())
-        valid_ic = _pearson(scores_valid, yva.to_numpy())
+
+        if task == "binary":
+            # Discrimination on the holdout split (IC is uninformative on
+            # a 0/1 target). These are the numbers that matter.
+            from pytrader.metrics import roc_auc, precision_at_k
+            train_ic = 0.0
+            valid_ic = 0.0
+            binary_stats = {
+                "val_auc": roc_auc(yva.to_numpy(dtype="float64"), scores_valid),
+                f"val_top{pipeline.top_n}_precision": precision_at_k(
+                    yva.to_numpy(dtype="float64"), scores_valid, k=pipeline.top_n),
+                "val_base_rate": float(np.mean(yva.to_numpy())),
+            }
+        else:
+            train_ic = _pearson(scores_train, ytr.to_numpy())
+            valid_ic = _pearson(scores_valid, yva.to_numpy())
+            binary_stats = {}
+
         Xall = X_full[X_full["y"].notna()]
         scores_all = model.predict(Xall[feat_cols])
         preds = predictions_from_panel(Xall, scores_all)
@@ -186,6 +216,8 @@ def run_strategy(
     metrics["metrics"]["avg_turnover"] = round(avg_turn, 6)
     metrics["metrics"]["train_ic"] = round(train_ic, 6)
     metrics["metrics"]["valid_ic"] = round(valid_ic, 6)
+    if binary_stats:
+        metrics["metrics"].update({k: round(float(v), 6) for k, v in binary_stats.items()})
 
     if sim.benchmark_equity is not None:
         metrics["metrics"].setdefault("benchmark_ir", metrics["benchmark"].get(
@@ -205,6 +237,7 @@ def run_strategy(
             {"ticker": d.info.ticker, "reasons": d.reasons} for d in rejected
         ][:20],
         "feature_set": feat_cols + ["horizon", "top_n"],
+        "task": task,
     })
     if wf_meta:
         out_cfg.update(wf_meta)

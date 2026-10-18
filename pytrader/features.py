@@ -124,11 +124,25 @@ def future_return(close: pd.Series, horizon: int) -> pd.Series:
     return np.log(close.shift(-horizon) / close)
 
 
+def binary_updown(close: pd.Series, horizon: int) -> pd.Series:
+    """Binary label: 1.0 if close is strictly higher `horizon` days ahead,
+    else 0.0 (NaN at the end of the series where there is no future).
+
+    A 0/1 target that smooths over intra-month macro shocks — the signal we
+    want is the *sign* of the multi-month move, not its magnitude.
+    """
+    future = close.shift(-horizon)
+    out = (future > close).astype("float64")
+    out[future.isna()] = np.nan
+    return out
+
+
 def compute_panel(
     series: list[DailyPrice],
     spec: FeatureSpec,
     horizon: int,
     benchmark: str | None = None,
+    label_kind: str = "regression",
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Stack all series into a long panel.
 
@@ -136,7 +150,17 @@ def compute_panel(
     (date, ticker) and X_panel columns are spec.column_names().
     Rows without a valid future label are kept in X but dropped from y;
     the model caller aligns on non-NaN y.
+
+    `label_kind`:
+      "regression" — y is the log return `horizon` ahead (default).
+      "binary"     — y is 1/0 for "close higher `horizon` ahead".
     """
+    label_fn = {
+        "regression": future_return,
+        "binary": binary_updown,
+    }.get(label_kind)
+    if label_fn is None:
+        raise ValueError(f"unknown label_kind: {label_kind!r}")
     frames = []
     labels = {}
     bench_close = None
@@ -150,7 +174,7 @@ def compute_panel(
         f = f.reset_index()
         f = f.rename(columns={f.columns[0]: "date"})
         f["ticker"] = s.ticker.upper()
-        y = future_return(s.close, horizon)
+        y = label_fn(s.close, horizon)
         y = y.reset_index()
         y.columns = ["date", "y"]
         f = f.merge(y, on="date", how="left")

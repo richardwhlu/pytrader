@@ -124,6 +124,86 @@ def hit_rate(returns: pd.Series | np.ndarray) -> float:
     return float((r > 0).mean())
 
 
+def classification_report(
+    y_true: Sequence[float] | np.ndarray,
+    y_score: Sequence[float] | np.ndarray,
+    top_k: int = 5,
+) -> dict[str, float]:
+    """Discrimination block for the binary task.
+
+    AUC (ranking quality) and precision_at_k ("of the top-k picks, how
+    often are they actually up?"). These are the right summary stats for a
+    0/1 "up in 6 months" target — in-sample IC on a binary target is
+    uninformative.
+    """
+    return {
+        "auc": roc_auc(y_true, y_score),
+        f"precision_at_{int(top_k)}": precision_at_k(y_true, y_score, k=top_k),
+        "n_pos": int(np.asarray(y_true).sum()),
+        "base_rate": float(np.asarray(y_true).mean()),
+    }
+
+
+def roc_auc(y_true: Sequence[float] | np.ndarray,
+            y_score: Sequence[float] | np.ndarray) -> float:
+    """Area under the ROC curve (no external deps — computed by ranking).
+
+    `y_score` is the model's continuous confidence (e.g. P(up)); `y_true`
+    is the 0/1 label. Returns 1.0 for perfect ranking, 0.5 for random.
+    Degenerate inputs (no positive or no negative) return 0.5 (undefined).
+    """
+    yt = np.asarray(y_true, dtype="float64")
+    ys = np.asarray(y_score, dtype="float64")
+    m = ~(np.isnan(yt) | np.isnan(ys))
+    yt, ys = yt[m], ys[m]
+    pos = (yt == 1)
+    if pos.sum() == 0 or (~pos).sum() == 0:
+        return 0.5
+    # Rank-based AUC (Mann–Whitney U): P(score(pos) > score(neg)), with
+    # 0.5 credit for ties.
+    order = np.argsort(ys, kind="mergesort")
+    ranks = np.empty(len(ys), dtype="float64")
+    ranks[order] = np.arange(1, len(ys) + 1)
+    # Ties get the mean rank.
+    sorted_scores = ys[order]
+    i = 0
+    while i < len(sorted_scores):
+        j = i
+        while j + 1 < len(sorted_scores) and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        if j > i:
+            avg = (ranks[order[i:j + 1]].mean())
+            ranks[order[i:j + 1]] = avg
+        i = j + 1
+    n_pos = int(pos.sum())
+    n_neg = int((~pos).sum())
+    rank_sum_pos = ranks[pos].sum()
+    # Mann–Whitney U statistic
+    u = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
+    auc = u / (n_pos * n_neg)
+    return float(auc)
+
+
+def precision_at_k(y_true: Sequence[float] | np.ndarray,
+                   y_score: Sequence[float] | np.ndarray,
+                   k: int = 5) -> float:
+    """Fraction of the top-k scored names that are actually positive.
+
+    The most decision-relevant metric for this product — "when we pick the
+    top 5, how often are they up?"  Falls back to the base rate when there
+    are fewer than k scored rows.
+    """
+    yt = np.asarray(y_true, dtype="float64")
+    ys = np.asarray(y_score, dtype="float64")
+    m = ~(np.isnan(yt) | np.isnan(ys))
+    yt, ys = yt[m], ys[m]
+    if len(ys) == 0 or (yt == 1).sum() == 0:
+        return 0.0
+    k = max(1, min(int(k), len(ys)))
+    top_k = np.argsort(ys)[::-1][:k]
+    return float((yt[top_k] == 1).mean())
+
+
 def information_ratio(strategy_ret: pd.Series, bench_ret: pd.Series) -> float:
     active = np.asarray(strategy_ret, dtype="float64") - np.asarray(
         bench_ret, dtype="float64"

@@ -20,6 +20,92 @@ class Model(Protocol):
     def feature_names(self) -> list[str]: ...
 
 
+class XGBoostBinaryModel:
+    """Binary XGBoost classifier wrapped behind the same `Model` contract.
+
+    `predict` returns **probabilities** of the positive class (0.0–1.0),
+    so a top-N "highest score" selection still means "most likely to rise".
+    This is the seam for the "will it be up in 6 months" task.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 300,
+        max_depth: int = 4,
+        learning_rate: float = 0.05,
+        subsample: float = 0.9,
+        colsample_bytree: float = 0.9,
+        reg_lambda: float = 1.0,
+        random_state: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.verbose = verbose
+        self.params = dict(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_lambda=reg_lambda,
+            random_state=random_state,
+            tree_method="hist",
+        )
+        self._clf = None
+        self._features: list[str] = []
+
+    def fit(self, X: pd.DataFrame, y: np.ndarray) -> "XGBoostBinaryModel":
+        import xgboost as xgb
+        self._features = list(X.columns)
+        y = np.asarray(y).astype("int64")
+        if len(np.unique(y)) < 2:
+            raise ValueError("binary model needs both classes present in train set")
+        with _QuietFit(enabled=not self.verbose):
+            self._clf = xgb.XGBClassifier(
+                objective="binary:logistic", verbosity=0, **self.params
+            ).fit(X, y)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Probability of the positive ("up") class, in [0, 1]."""
+        if self._clf is None:
+            raise RuntimeError("model not fit")
+        return self._clf.predict_proba(X)[:, 1]
+
+    def feature_names(self) -> list[str]:
+        return list(self._features)
+
+    def feature_importance(self) -> list[tuple[str, float]]:
+        if self._clf is None:
+            return []
+        imp = self._clf.feature_importances_
+        return sorted(zip(self._features, imp), key=lambda p: -p[1])
+
+    def save(self, directory: Path, meta: dict | None = None) -> Path:
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        p = directory / "model.json"
+        self._clf.save_model(str(p))
+        m = directory / "meta.json"
+        m.write_text(json.dumps({
+            "kind": "binary",
+            "features": self._features,
+            "params": self.params,
+            **({"meta": meta} if meta else {}),
+        }, indent=2))
+        return p
+
+    @classmethod
+    def load(cls, directory: Path) -> "XGBoostBinaryModel":
+        import xgboost as xgb
+        meta = json.loads((directory / "meta.json").read_text())
+        m = cls()
+        m._features = meta["features"]
+        m._clf = xgb.XGBClassifier()
+        m._clf.load_model(str(directory / "model.json"))
+        m.meta = meta.get("meta", {})
+        return m
+
+
 class _QuietFit:
     """Silence a block by pointing stdout and stderr fds at /dev/null.
 
