@@ -12,6 +12,7 @@ Routes:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -203,7 +204,16 @@ def create_app(
             res = run_strategy(store, cfg, db=db, name=name, pipeline=p,
                                feature_store=fs)
         except Exception as e:  # noqa: BLE001
-            return jsonify({"error": str(e)}), 400
+            import traceback as _tb
+            # Surface the full stack in the JSON so a browser-side error has a
+            # debuggable payload (mirrors the CLI behavior). 500 for genuine
+            # failures — the caller was not at fault.
+            logging.getLogger("pytrader.server").error("backtest failed", exc_info=e)
+            return jsonify({
+                "error": str(e),
+                "type": type(e).__name__,
+                "traceback": _tb.format_exc(),
+            }), 500
         return jsonify({
             "run_id": res.run_id,
             "name": res.name,
