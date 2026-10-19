@@ -184,7 +184,7 @@ class YFinanceStore(PriceStore):
             if df is None or df.empty:
                 raise DataUnavailable(f"no data for {t}: {last_err}")
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_levelValues(0)
+                df.columns = df.columns.get_level_values(0)
             close = df["Close"].dropna()
             if close.empty or close.isna().all():
                 raise DataUnavailable(f"no closes for {t}")
