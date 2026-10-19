@@ -20,6 +20,11 @@ Not an investment product. No live order execution. Everything runs locally.
 
 ## Quick start
 
+> **Using the build as-is?** See [`USAGE.md`](USAGE.md) for a task-by-task
+> walkthrough: collect data, run a regression or binary up/down backtest,
+> walk-forward, and query the point-in-time feature store. Everything below
+> explains *why it's designed this way*.
+
 ```bash
 # environment (uv-managed, Python 3.12)
 uv sync --extra dev
