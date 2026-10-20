@@ -8,11 +8,14 @@ exchange's trading calendar, one row per date ascending.
 from __future__ import annotations
 
 import abc
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING
 
 import pandas as pd
+
+from pytrader.diagnostics import ErrorDetail, capture
 
 if TYPE_CHECKING:
     from pytrader.storage import PriceStorage
@@ -182,12 +185,20 @@ class YFinanceStore(PriceStore):
                 except Exception as e:  # noqa: BLE001 – yfinance raises broadly
                     last_err = e
             if df is None or df.empty:
-                raise DataUnavailable(f"no data for {t}: {last_err}")
+                # Chain the underlying yfinance/pandas exception so the full
+                # library traceback is reachable via `__cause__` (and visible
+                # in `ErrorDetail.cause_chain` + `traceback`).
+                raise DataUnavailable(
+                    f"no data for {t}"
+                    + (f": {last_err}" if last_err else "")
+                ) from last_err
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             close = df["Close"].dropna()
             if close.empty or close.isna().all():
-                raise DataUnavailable(f"no closes for {t}")
+                raise DataUnavailable(
+                    f"no closes for {t} (got {len(df)} rows, columns={list(df.columns)})"
+                )
             close = close.astype("float64")
             # yfinance's auto_adjust=False → use Adj Close if present
             if "Adj Close" in df.columns:
@@ -208,7 +219,13 @@ class YFinanceStore(PriceStore):
                     "name": str(info.get("longName") or info.get("shortName") or t),
                     "sector": str(info.get("sector") or "").strip(),
                 }
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001 – metadata is best-effort
+                # Surface the real error (rate limit, network, schema change)
+                # so a failed metadata pull is not silently swallowed.
+                logging.getLogger("pytrader.data").warning(
+                    "metadata failed for %s: %s: %s",
+                    t, type(e).__name__, e, exc_info=e,
+                )
                 out[t.upper()] = {"name": t, "sector": ""}
         return out
 
@@ -255,6 +272,7 @@ def batch_download(
     fetched: list[str] = []
     cached_skip: list[str] = []
     failed: list[str] = []
+    failures: list[ErrorDetail] = []
     import time as _time
 
     # Partition: cached (skip) vs todo (fetch).
@@ -278,8 +296,12 @@ def batch_download(
                 meta = upstream.metadata([t]).get(t, {"name": t, "sector": ""})
                 cache.save_meta(t, meta)
                 fetched.append(t)
-            except Exception:  # noqa: BLE001 — one bad ticker must not kill the batch
+            except Exception as e:  # noqa: BLE001 — one bad ticker must not kill the batch
+                # Capture the full traceback so the CLI can show it. We keep
+                # the ticker in the `failed` list (for the existing shape) and
+                # add the structured detail to `failures` (new, opt-in).
                 failed.append(t)
+                failures.append(capture(e, where=t, context={"start": start.isoformat()}))
     return {
         "fetched": fetched,
         "cached_skip": cached_skip,
@@ -287,4 +309,5 @@ def batch_download(
         "n_fetched": len(fetched),
         "n_cached": len(cached_skip),
         "n_failed": len(failed),
+        "failures": failures,
     }

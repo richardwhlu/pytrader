@@ -86,8 +86,18 @@ def run_download_cli() -> None:
         print("          " + ", ".join(summary["fetched"]))
     print(f"cached  : {summary['n_cached']:>4}  already present")
     print(f"failed  : {summary['n_failed']:>4}")
-    if summary["failed"]:
+    if summary.get("failed"):
         print("          " + ", ".join(summary["failed"]))
+    if summary.get("failures"):
+        # Full traceback for each failure — the thing the user was missing
+        # before (they got a list of tickers but no way to debug them).
+        from pytrader.diagnostics import ErrorDetail as _ED
+        print()
+        for d in summary["failures"]:
+            if isinstance(d, _ED):
+                print(d.format(max_lines=80))
+            else:
+                print(d)
 
 
 if __name__ == "__main__":

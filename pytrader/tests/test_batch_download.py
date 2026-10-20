@@ -88,3 +88,68 @@ def test_all_tickers_cached_regardless_of_batch_size(db):
     assert res["n_failed"] == 0
     for t in ["A", "B", "C", "D", "E"]:
         assert db.end_date(t) is not None
+
+
+class _FailingUpstream(PriceStore):
+    """Raises a *wrapped* exception: our wrapper from an inner KeyError.
+
+    This is the shape of a real yfinance failure (e.g. rate-limit 429 or a
+    missing symbol surfacing as a nested exception), and it is the case the
+    user said they could not debug before — the failure list had the ticker
+    but nothing to look at.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def fetch(self, tickers, start):
+        self.calls += 1
+        for t in tickers:
+            raise DataUnavailable(f"no data for {t}: underlying boom") \
+                from KeyError(f"symbol for {t.upper()}")
+
+    def metadata(self, tickers):
+        return {t.upper(): {"name": t, "sector": ""} for t in tickers}
+
+
+def test_failures_carry_cause_chain_and_traceback(db):
+    """A failed ticker must surface a debuggable ErrorDetail, not just a name.
+
+    This is the exact scenario the fix is for: the previous CLI output was
+    ``failed: SPY, NVDA`` with no stack to debug against. Now the summary
+    carries a structured detail with the wrapped library exception — its
+    type, message, cause chain, and full traceback.
+    """
+    from pytrader.diagnostics import ErrorDetail  # noqa: F401
+
+    up = _FailingUpstream()
+    res = batch_download(up, db, ["A"], datetime.date(2024, 1, 1), pause_seconds=0)
+
+    # Backward-compatible shape still present:
+    assert res["n_failed"] == 1
+    assert res["failed"] == ["A"]
+
+    # New: structured failures, one per failed ticker.
+    assert len(res["failures"]) == 1, f"summary: {res}"
+    d = res["failures"][0]
+    assert isinstance(d, ErrorDetail)
+    assert d.where == "A"
+    assert d.type == "DataUnavailable"
+
+    # The *wrapped* library exception is preserved in cause_chain:
+    assert "KeyError" in d.cause_chain, f"expected KeyError in {d.cause_chain!r}"
+
+    # And the traceback is real — it must show BOTH the inner library frame
+    # (KeyError) and our wrapper (DataUnavailable), linked by the standard
+    # "was the direct cause of" bridge. That is the "full stacktrace" the
+    # user was missing before.
+    assert d.traceback
+    assert "KeyError" in d.traceback
+    assert "DataUnavailable" in d.traceback
+    assert "no data for A" in d.message
+    assert "direct cause" in d.traceback or "Traceback" in d.traceback
+
+    # `format()` renders something a human can read, including the cause.
+    rendered = d.format()
+    assert "KeyError" in rendered
+    assert "DataUnavailable" in rendered
