@@ -384,10 +384,222 @@
     }
   }
 
+  /* ---------- historical re-indexed visualizer ---------- */
+  let histTickers = [];            // [{ticker,name,sector,end_date}]
+  let histResult = null;           // last /api/series response
+
+  const MSZ = (d) => Date.parse(d + "T00:00:00Z");
+
+  function histSelected() {
+    return [...document.querySelectorAll("#hist-ticker-list input[type=checkbox]")
+      ].filter((b) => b.checked).map((b) => b.value);
+  }
+
+  function parseWeights() {
+    const map = new Map();
+    for (const line of $("#hist-weights").value.split(/\r?\n/)) {
+      const m = line.trim().match(/^([A-Za-z.0-9^\-=]+)\s*=\s*([-+]?[0-9.eE]+)$/);
+      if (m) map.set(m[1].toUpperCase(), parseFloat(m[2]));
+    }
+    return map;
+  }
+
+  // Weights rule (documented in the UI): textarea empty -> equal weights.
+  // Otherwise a selected ticker's weight is its explicit value if listed,
+  // else 0; the whole set is then normalized to sum to 1. The *effective*
+  // (normalized) weight is shown in the P&L table.
+  function effectiveWeights(selected) {
+    const wmap = parseWeights();
+    const explicit = new Map();
+    for (const t of selected) if (wmap.has(t)) explicit.set(t, wmap.get(t));
+    if (!explicit.size) {
+      const eq = 1 / (selected.length || 1);
+      return selected.map((t) => ({ ticker: t, weight: eq }));
+    }
+    const weights = selected.map((t) => ({ ticker: t, weight: explicit.get(t) || 0 }));
+    const total = weights.reduce((a, b) => a + b.weight, 0) || 1;
+    return weights.map((r) => ({ ticker: r.ticker, weight: r.weight / total }));
+  }
+
+  // Composite = inner-join of selected series, sum of (weight * pctgain) at
+  // each common date. Because every series is ~0 on its base day, this is a
+  // clean daily-rebalanced portfolio line.
+  function computeComposite(selected, result, normWeights) {
+    const w = new Map(normWeights.map((r) => [r.ticker, r.weight]));
+    const avail = selected.filter((t) => result.series && result.series[t]);
+    if (!avail.length) return null;
+    const series = avail.map((t) => new Map(result.series[t].points));
+    const days = [...series[0].keys()].sort();
+    const out = [];
+    for (const d of days) {
+      if (!series.every((m) => m.has(d))) continue;
+      let v = 0;
+      for (let i = 0; i < avail.length; i++) {
+        v += (w.get(avail[i]) || 0) * (series[i].get(d) || 0);
+      }
+      out.push([d, v]);
+    }
+    return out.length ? out : null;
+  }
+
+  function fmtPctSigned(v, digits = 1) {
+    if (v == null || Number.isNaN(v)) return "–";
+    return `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`;
+  }
+
+  async function loadHistTickers() {
+    const list = $("#hist-ticker-list");
+    const noCache = $("#hist-no-cache");
+    list.innerHTML = "";
+    try {
+      const data = await api("/api/tickers");
+      histTickers = (data.tickers || []).slice().sort((a, b) =>
+        a.ticker < b.ticker ? -1 : 1);
+      if (!histTickers.length) { noCache.classList.remove("hidden"); return; }
+      noCache.classList.add("hidden");
+      for (const t of histTickers) {
+        const row = el("label", "hist-row");
+        const cb = document.createElement("input");
+        cb.type = "checkbox"; cb.value = t.ticker;
+        row.append(cb, el("span", "tk", t.ticker), el("span", "nm", t.name),
+                   el("span", "end", t.end_date || ""));
+        list.append(row);
+      }
+      // Sensible defaults: check up to the first 4 tickers.
+      const boxes = [...list.querySelectorAll("input[type=checkbox]")];
+      boxes.slice(0, Math.min(4, boxes.length)).forEach((b) => (b.checked = true));
+    } catch (e) {
+      noCache.textContent = `Could not load cached tickers: ${e.message}`;
+    }
+  }
+
+  async function generateHist() {
+    const status = $("#hist-status");
+    const btn = $("#hist-go");
+    const selected = histSelected();
+    if (!selected.length) { setStatus(status, "Pick at least one ticker.", true); return; }
+    const start = $("#hist-start").value;
+    const horizon = parseInt($("#hist-horizon").value, 10) || 0;
+    btn.disabled = true;
+    setStatus(status, "Computing…");
+    let result;
+    try {
+      const qs = new URLSearchParams({ tickers: selected.join(",") });
+      if (start) qs.set("start_date", start);
+      if (horizon > 0) qs.set("horizon", String(horizon));
+      result = await api(`/api/series?${qs.toString()}`);
+    } catch (e) {
+      setStatus(status, e.message, true);
+      btn.disabled = false;
+      return;
+    }
+    histResult = result;
+    const norm = effectiveWeights(selected);
+    const composite = computeComposite(selected, result, norm);
+
+    // ----- chart -----
+    const avail = selected.filter((t) => result.series[t]);
+    const seriesList = avail.map((t, i) => ({
+      label: t,
+      color: PALETTE[i % PALETTE.length],
+      points: (result.series[t].points || [])
+        .map(([d, v]) => ({ t: MSZ(d), v })),
+    }));
+    if (composite) {
+      seriesList.push({
+        label: "COMPOSITE",
+        color: "#f5f7fa",
+        points: composite.map(([d, v]) => ({ t: MSZ(d), v })),
+      });
+    }
+    $("#hist-chart-empty").classList.add("hidden");
+    drawChart($("#hist-chart"), seriesList);
+
+    // ----- legend -----
+    const legend = $("#hist-legend");
+    legend.innerHTML = "";
+    for (const s of seriesList) {
+      const li = document.createElement("li");
+      const sw = el("span", "swatch", "");
+      sw.style.background = s.color === "#f5f7fa" ? "" : s.color;
+      if (s.color === "#f5f7fa") sw.style.background =
+        "repeating-linear-gradient(90deg,#f5f7fa 0 4px,transparent 4px 7px)";
+      const nm = el("span", null, s.label === "COMPOSITE"
+        ? "Composite (weighted)" : s.label);
+      li.append(sw, nm);
+      legend.append(li);
+    }
+
+    // ----- P&L table -----
+    const wmap = new Map(norm.map((r) => [r.ticker, r.weight]));
+    const tbody = $("#hist-table-body");
+    tbody.innerHTML = "";
+    const missing = result.missing || [];
+    for (const t of selected) {
+      const s = result.series[t];
+      const tr = document.createElement("tr");
+      if (!s) {
+        tr.append(el("td", "ticker", t),
+                  el("td", "muted", "not in cache"),
+                  el("td", ""), el("td", ""), el("td", ""), el("td", ""));
+      } else {
+        const ret = s.end_pct;
+        const contrib = (wmap.get(t) || 0) * ret;
+        tr.append(
+          el("td", "ticker", t),
+          el("td", null, s.base_date),
+          el("td", null, s.points.length ? s.points[s.points.length - 1][0] : ""),
+          el("td", "num", (wmap.get(t) || 0).toFixed(3)),
+          el("td", "num " + (ret >= 0 ? "up" : "down"), fmtPctSigned(ret)),
+          el("td", "num " + (contrib >= 0 ? "up" : "down"), fmtPctSigned(contrib)),
+        );
+      }
+      tbody.append(tr);
+    }
+    $("#hist-table-empty").classList.add("hidden");
+
+    // ----- composite total -----
+    const tot = $("#hist-composite-val");
+    if (composite && composite.length) {
+      const lastV = composite[composite.length - 1][1];
+      tot.textContent = fmtPctSigned(lastV);
+      tot.className = "big " + (lastV >= 0 ? "up" : "down");
+    } else {
+      tot.textContent = "–";
+      tot.className = "big";
+    }
+
+    setStatus(status,
+      `${avail.length}/${selected.length} plotted` +
+      (missing.length ? ` · not cached: ${missing.join(", ")}` : "") +
+      (composite ? "" : " · no shared dates for composite"),
+      !!missing.length);
+    btn.disabled = false;
+  }
+
+  function bindHistorical() {
+    const list = $("#hist-ticker-list");
+    const go = $("#hist-go");
+    const update = () => { go.disabled = histSelected().length === 0; };
+    list.addEventListener("change", update);
+    go.addEventListener("click", generateHist);
+    $("#hist-all").addEventListener("click", () => {
+      list.querySelectorAll("input[type=checkbox]").forEach((b) => (b.checked = true));
+      update();
+    });
+    $("#hist-none").addEventListener("click", () => {
+      list.querySelectorAll("input[type=checkbox]").forEach((b) => (b.checked = false));
+      update();
+    });
+    update();
+  }
+
   /* ---------- boot ---------- */
   document.addEventListener("DOMContentLoaded", async () => {
     bindForm();
     loadUniverse();
+    bindHistorical();
+    loadHistTickers();
     await loadRuns();
     window.addEventListener(
       "resize",

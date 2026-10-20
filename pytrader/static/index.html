@@ -58,7 +58,95 @@
         </form>
       </section>
 
-      <!-- ===== B. Performance ===== -->
+      <!-- ===== B. Historical (re-indexed visualizer) ===== -->
+      <section id="historical" class="panel" aria-labelledby="hist-h">
+        <h2 id="hist-h">Historical — Re-indexed from any date</h2>
+        <p class="hint">
+          Pick the tickers you want, a base date, and an optional window
+          (trading days). Each line is <strong>percent gain from the base
+          day</strong> — so on the base day every line reads <strong>0%</strong>,
+          and "NVDA +200% in two years" reads straight off the y-axis.
+          The dashed line is the <strong>weighted composite</strong>: the
+          portfolio return you would have earned starting that day with the
+          weights you chose (blank weights = equal-weight).
+        </p>
+        <div id="hist-status" class="inline-status" role="status"></div>
+
+        <div class="hist-grid">
+          <!-- Controls -->
+          <div class="card hist-controls">
+            <h3>Select tickers</h3>
+            <div class="hist-rows" id="hist-ticker-list" aria-label="Tickers"></div>
+            <div class="hint" id="hist-no-cache">
+              No cached prices yet. Run <code>pytrader-download</code> first —
+              or pick a small universe and try again.
+            </div>
+            <div class="hist-actions">
+              <button type="button" class="btn small" id="hist-all">Select all</button>
+              <button type="button" class="btn small" id="hist-none">Clear</button>
+            </div>
+            <hr>
+            <h3>Weights</h3>
+            <p class="hint">
+              Blank = equal-weight. Otherwise use one line per ticker:
+              <code>TICKER=0.5</code>. Weights auto-normalize to sum 1.
+            </p>
+            <textarea id="hist-weights" rows="4"
+                      placeholder="NVDA=0.5&#10;MSFT=0.3&#10;SPY=0.2"
+                      spellcheck="false"></textarea>
+
+            <hr>
+            <h3>Window</h3>
+            <div class="form-grid">
+              <div class="field span2">
+                <label for="hist-start">Base date</label>
+                <input id="hist-start" type="date" value="2020-01-01">
+              </div>
+              <div class="field span2">
+                <label for="hist-horizon">End (trading days) <span class="opt">0 = all</span></label>
+                <input id="hist-horizon" type="number" min="0" max="20000" step="1" value="252" inputmode="numeric">
+              </div>
+            </div>
+            <div class="hist-actions">
+              <button type="button" class="btn" id="hist-go" disabled>Generate</button>
+            </div>
+          </div>
+
+          <!-- Chart -->
+          <div class="card hist-chart">
+            <canvas id="hist-chart" role="img"
+                    aria-label="Re-indexed price lines, base = 100"></canvas>
+            <ul id="hist-legend" class="hist-legend" aria-live="polite"></ul>
+            <div id="hist-chart-empty" class="empty hidden">
+              Generate a chart to see it here.
+            </div>
+
+            <h3>P&L at end of window</h3>
+            <div class="table-wrap">
+              <table class="data-table" id="hist-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Base date</th>
+                    <th>End date</th>
+                    <th>Weight</th>
+                    <th>Return</th>
+                    <th>Contribution</th>
+                  </tr>
+                </thead>
+                <tbody id="hist-table-body"></tbody>
+              </table>
+            </div>
+            <div id="hist-table-empty" class="empty hidden">—</div>
+            <div class="hist-composite">
+              <div>Composite weighted return</div>
+              <div id="hist-composite-val" class="big">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== C. Performance ===== -->
       <section id="performance" class="panel" aria-labelledby="perf-h">
         <h2 id="perf-h">Performance</h2>
 

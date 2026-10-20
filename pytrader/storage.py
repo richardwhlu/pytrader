@@ -75,6 +75,8 @@ class PriceStorage(abc.ABC):
                                    stale series by re-saving.
       load_meta(ticker)         -> dict[str, str] | None
       save_meta(ticker, meta)   -> None
+      tickers()                 -> list[str]
+                                   All tickers in the cache (for pickers).
     """
 
     @abc.abstractmethod
@@ -91,6 +93,9 @@ class PriceStorage(abc.ABC):
 
     @abc.abstractmethod
     def save_meta(self, ticker: str, meta: dict[str, str]) -> None: ...
+
+    @abc.abstractmethod
+    def tickers(self) -> list[str]: ...
 
 
 class FeatureStorage(abc.ABC):
@@ -294,6 +299,17 @@ class DuckDBStore(DB, PriceStorage, FeatureStorage):
         if row is None:
             return None
         return {"name": row[0] or ticker, "sector": row[1] or ""}
+
+    def tickers(self) -> list[str]:
+        """All tickers currently in the price cache, sorted alphabetically.
+
+        Powers the UI's ticker pickers (historical visualizer, universe).
+        O(distinct) — one tiny aggregation.
+        """
+        rows = self._con.execute(
+            "SELECT DISTINCT ticker FROM market_prices ORDER BY ticker"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def save_meta(self, ticker: str, meta: dict[str, str]) -> None:
         self._con.execute(

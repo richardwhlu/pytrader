@@ -140,3 +140,108 @@ def test_backtest_validation(client):
     ).status_code == 400
     # non-numeric types are rejected too
     assert client.post("/api/backtest", json={"horizon": "lots"}).status_code == 400
+
+
+# ---------------------------------------------------------------------
+# /api/tickers + /api/series  (Historical re-indexed visualizer)
+# ---------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+from datetime import date
+
+@pytest.fixture
+def price_db(tmp_path):
+    """Two tickers with known closes, saved into a temp DuckDBStore."""
+    d = DuckDBStore(tmp_path / "hist.duckdb")
+    idx = pd.bdate_range("2019-11-15", "2020-03-15")  # ~90 business days
+    # A: flat 100, then +30%.
+    closes_a = list(np.repeat(100.0, 30)) + list(np.linspace(100, 130, len(idx) - 30))
+    # B: flat 100, then -15%.
+    closes_b = list(np.repeat(100.0, 30)) + list(np.linspace(100, 85, len(idx) - 30))
+    d.save("A", pd.Series(closes_a, index=idx, name="A"))
+    d.save("B", pd.Series(closes_b, index=idx, name="B"))
+    return d
+
+
+def test_api_tickers_lists_cached(price_db, cfg):
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get("/api/tickers")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert {t["ticker"] for t in body["tickers"]} == {"A", "B"}
+        # Each row carries name/sector/end_date for the UI to render.
+        for row in body["tickers"]:
+            assert row["ticker"] in {"A", "B"}
+            assert "name" in row and "sector" in row and "end_date" in row
+
+
+def test_api_series_base_is_zero_and_end_matches(price_db, cfg):
+    d = price_db
+    first_a = d.load("A").iloc[0]
+    last_a = d.load("A").iloc[-1]
+    expected_end_a = (last_a / first_a - 1) * 100.0  # ~ +30%
+
+    last_b = d.load("B").iloc[-1]
+    expected_end_b = (last_b / d.load("B").iloc[0] - 1) * 100.0  # ~ -15%
+
+    app = create_app(cfg=cfg, db=d)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get("/api/series?tickers=A,B")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert set(body["series"].keys()) == {"A", "B"}
+        a = body["series"]["A"]
+        b = body["series"]["B"]
+        # First point of each series must be 0 (the base day = 0).
+        assert a["points"][0][1] == 0.0, f"A should start at 0, got {a['points'][0]}"
+        assert b["points"][0][1] == 0.0
+        # End-of-window % gain matches the computed value.
+        assert abs(a["end_pct"] - expected_end_a) < 1e-9
+        assert abs(b["end_pct"] - expected_end_b) < 1e-9
+        # Per-ticker P&L metadata is present.
+        assert a["base_close"] > 0
+
+
+def test_api_series_slices_to_start_date(price_db, cfg):
+    d = price_db
+    # Start on a day ~15 into the series so the base is the 15th close, not
+    # the first close. The base day must still be 0.
+    start = d.load("A").index[15].date().isoformat()
+    base = d.load("A").iloc[15]  # this becomes the new "100 / 0%"
+    app = create_app(cfg=cfg, db=d)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get(f"/api/series?tickers=A&start_date={start}")
+        body = r.get_json()
+        a = body["series"]["A"]
+        assert a["base_date"] == start
+        assert a["points"][0][1] == 0.0
+        assert a["base_close"] == base
+        # No points before start_date.
+        for dstr, _ in a["points"]:
+            assert dstr >= start
+
+
+def test_api_series_horizon_caps_the_window(price_db, cfg):
+    d = price_db
+    n_days = len(d.load("A"))
+    app = create_app(cfg=cfg, db=d)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get(f"/api/series?tickers=A&horizon=10")
+        body = r.get_json()
+        assert len(body["series"]["A"]["points"]) == 10
+
+
+def test_api_series_missing_ticker_reported(price_db, cfg):
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get("/api/series?tickers=A,ZZZ")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "A" in body["series"]
+        assert "ZZZ" in body["missing"]

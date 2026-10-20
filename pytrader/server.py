@@ -87,6 +87,123 @@ def create_app(
             ],
         })
 
+    @app.get("/api/tickers")
+    def tickers():
+        """List every ticker we have cached prices for.
+
+        Powers the UI's ticker pickers (historical visualizer, universe).
+        Returns sorted tickers + their cached name/sector/end_date so the
+        picker can render readable rows without an extra round-trip per row.
+        """
+        out = []
+        for t in db.tickers():
+            meta = db.load_meta(t) or {}
+            end = db.end_date(t)
+            out.append({
+                "ticker": t,
+                "name": meta.get("name", t),
+                "sector": meta.get("sector", ""),
+                "end_date": end.date().isoformat() if end is not None else None,
+            })
+        return jsonify({"tickers": out})
+
+    @app.get("/api/series")
+    def series():
+        """Percent-gain series from `start_date` (0% on the base day).
+
+        Query params:
+          tickers    (required, comma-separated) e.g. "NVDA,MSFT,SPY"
+          start_date (optional, YYYY-MM-DD; defaults to earliest cached
+                      close among the selected tickers)
+          horizon    (optional, days) caps the chart to start + horizon.
+                     Use 0 / omit to go to the latest cached date.
+
+        Response shape:
+          {
+            "start": "YYYY-MM-DD",           # earliest base date across selected
+            "end":   "YYYY-MM-DD",           # end of the returned window
+            "series": {T: {"name","sector","base_date","base_close","end_close",
+                           "end_pct", "points": [["YYYY-MM-DD", pct_gain], ...]}},
+            "missing": [T, ...]              # requested but not cached
+          }
+
+        Values are **percent gain from the base day**: the first trading day
+        at/after `start_date` for each ticker → 0%, then whatever % it's
+        up/down by the end. So "NVDA at 0 on 2020-01-01, +200% two years
+        later" reads straight off the y-axis (base=0, end≈+200).
+        """
+        raw_tickers = (request.args.get("tickers") or "").split(",")
+        tickers = [t.strip().upper() for t in raw_tickers if t.strip()]
+        if not tickers:
+            return jsonify({"error": "tickers is required"}), 400
+
+        start_raw = request.args.get("start_date")
+        try:
+            horizon = int(request.args.get("horizon") or 0)
+        except ValueError:
+            return jsonify({"error": "horizon must be an integer (trading days)"}), 400
+        if horizon < 0:
+            return jsonify({"error": "horizon must be >= 0"}), 400
+
+        start_ts: pd.Timestamp | None = None
+        if start_raw:
+            try:
+                start_ts = pd.Timestamp(start_raw).normalize()
+            except (ValueError, TypeError):
+                return jsonify({"error": "start_date must be YYYY-MM-DD"}), 400
+
+        out_series: dict[str, dict] = {}
+        missing: list[str] = []
+        # Track the earliest start-date we can actually offer per ticker, and
+        # the global earliest/latest close so the UI has the bounds.
+        global_earliest: pd.Timestamp | None = None
+        global_latest: pd.Timestamp | None = None
+        for t in tickers:
+            s: pd.Series | None = db.load(t)
+            if s is None or len(s) == 0:
+                missing.append(t)
+                continue
+            if start_ts is not None:
+                s = s.loc[s.index >= start_ts]
+                if len(s) == 0:
+                    # Nothing after start_date — treat as missing.
+                    missing.append(t)
+                    continue
+                base = s.iloc[0]
+            else:
+                base = s.iloc[0]
+            if base <= 0:
+                # Can't reindex against a non-positive price.
+                missing.append(t)
+                continue
+            # Percent gain from the base day: 0% on the base day itself.
+            gain = (s / base - 1.0) * 100.0
+            # Cap the window at `horizon` trading days from the base.
+            if horizon > 0:
+                gain = gain.iloc[:horizon]
+            end_close = float(s.loc[gain.index[-1]])
+            # Update global bounds.
+            e, l = gain.index[0], gain.index[-1]
+            global_earliest = e if global_earliest is None else min(global_earliest, e)
+            global_latest = l if global_latest is None else max(global_latest, l)
+            meta = db.load_meta(t) or {}
+            out_series[t] = {
+                "name": meta.get("name", t),
+                "sector": meta.get("sector", ""),
+                "base_date": gain.index[0].date().isoformat(),
+                "base_close": float(base),
+                "end_close": end_close,
+                "end_pct": float(gain.iloc[-1]),   # % change base→end
+                "points": [[d.date().isoformat(), float(v)]
+                           for d, v in list(gain.items())],
+            }
+        return jsonify({
+            "start": global_earliest.date().isoformat() if global_earliest else None,
+            "end": global_latest.date().isoformat() if global_latest else None,
+            "series": out_series,
+            "missing": missing,
+        })
+
     @app.get("/api/runs")
     def runs():
         recs = db.list_runs()
