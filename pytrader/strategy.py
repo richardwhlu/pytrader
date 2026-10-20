@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from pytrader import paths
 from pytrader.backtest import (
     BacktestConfig,
     SimulationResult,
@@ -257,7 +258,7 @@ def run_strategy(
     if wf_meta:
         out_cfg.update(wf_meta)
 
-    model_dir = model_dir or (Path(".pytrader") / "models" / run_id)
+    model_dir = model_dir or paths.models_dir(run_id)
     try:
         if model_obj is not None and hasattr(model_obj, "save"):
             model_obj.save(model_dir, meta={"train_ic": train_ic, "valid_ic": valid_ic,

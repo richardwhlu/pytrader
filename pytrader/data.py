@@ -260,29 +260,54 @@ def batch_download(
 
     Fetches in `batch_size` chunks, pausing `pause_seconds` between
     chunks, so a large universe (hundreds of tickers) is collected without
-    tripping Yahoo's per-IP limit. Tickers already in the cache are skipped
-    (unless `overwrite`), which makes re-runs cheap and idempotent — the
-    first run pays the full network cost, subsequent runs only fill gaps.
+    tripping Yahoo's per-IP limit.
 
-    Returns a summary dict: {fetched, cached_skip, failed,
-    n_fetched, n_cached, n_failed}.
+    Gap intelligence:
+      * not in cache at all          -> fetch the full window.
+      * in cache, but its earliest
+        date is LATER than `start`  -> the user asked for more history than
+                                      we have; refetch from `start` and merge
+                                      (upsert) so the earlier rows are added.
+      * in cache and already covers
+        `start`                     -> skip ("cached"), unless `overwrite`.
+    So `--lookback-years 5` after `--lookback-years 1` fills the missing
+    4 years instead of reporting "already present".
+
+    Returns a summary dict: {fetched, cached_skip, gap_fill, failed,
+    n_fetched, n_cached, n_gap, n_failed, failures}.
     """
     if batch_size < 1:
         batch_size = 1
+    start_ts = pd.Timestamp(start)
     fetched: list[str] = []
     cached_skip: list[str] = []
+    gap_fill: list[str] = []
     failed: list[str] = []
     failures: list[ErrorDetail] = []
     import time as _time
 
-    # Partition: cached (skip) vs todo (fetch).
+    # Classify each ticker:
+    #   todo    -> needs/wants a fetch (never cached, gap at the front, or overwrite)
+    #   cached_skip -> already covers `start`; do nothing
+    # A ticker in `todo` *that already has data starting after `start`* is a
+    # gap-fill; we record it so the summary can report it separately.
     todo: list[str] = []
     for t in tickers:
         tu = t.upper()
-        if not overwrite and cache.end_date(tu) is not None:
-            cached_skip.append(tu)
-        else:
+        end = cache.end_date(tu)
+        if overwrite and end is not None:
             todo.append(tu)
+            continue
+        if end is None:
+            todo.append(tu)
+            continue
+        # Has data: only refetch if it starts later than what we asked for.
+        first = cache.start_date(tu)
+        if first is not None and first > start_ts:
+            todo.append(tu)
+            gap_fill.append(tu)
+        else:
+            cached_skip.append(tu)
 
     for i in range(0, len(todo), batch_size):
         chunk = todo[i:i + batch_size]
@@ -305,9 +330,11 @@ def batch_download(
     return {
         "fetched": fetched,
         "cached_skip": cached_skip,
+        "gap_fill": gap_fill,
         "failed": failed,
         "n_fetched": len(fetched),
         "n_cached": len(cached_skip),
+        "n_gap": len(gap_fill),
         "n_failed": len(failed),
         "failures": failures,
     }

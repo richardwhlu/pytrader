@@ -153,3 +153,69 @@ def test_failures_carry_cause_chain_and_traceback(db):
     rendered = d.format()
     assert "KeyError" in rendered
     assert "DataUnavailable" in rendered
+
+
+class _BoundedFake(PriceStore):
+    """Upstream that only returns closes since its own earliest date.
+
+    Simulates yfinance's real behavior: it returns whatever is in the
+    provider's history. We don't care about the exact numbers, only that
+    the code path that "fills a front gap" runs and lands more rows.
+    """
+
+    def __init__(self, series: dict[str, pd.Series]):
+        self.series = series
+        self.calls = 0
+        self.starts: list[pd.Timestamp] = []
+
+    def fetch(self, tickers, start):
+        self.calls += 1
+        out = []
+        s_start = pd.Timestamp(start)
+        for t in tickers:
+            s = self.series.get(t.upper())
+            if s is None:
+                raise DataUnavailable(t)
+            self.starts.append(s_start)
+            out.append(DailyPrice(t.upper(), s.index, s))
+        return out
+
+    def metadata(self, tickers):
+        return {t.upper(): {"name": t, "sector": ""} for t in tickers}
+
+
+def test_front_gap_gets_filled(db):
+    """If we have 1yr cached and the user asks for 5yr,
+    batch_download must refetch the wider window and land more history."""
+    full = pd.Series(
+        range(500),  # 500 trading days
+        index=pd.bdate_range("2022-01-01", periods=500),
+        dtype="float64",
+    )
+    # Simulate "we have 1yr" — save only the last 250 rows.
+    tail = full.iloc[-250:]
+    db.save("AAA", tail)
+    assert db.start_date("AAA") > full.index[0], \
+        "precondition: cached data must start AFTER the full data's first day"
+
+    # --- Case 1: user asks for a start LATER than what's cached → skip ---
+    later_than_cached = tail.index[10].date()  # safely inside cached range
+    up = _BoundedFake({"AAA": full})
+    res = batch_download(up, db, ["AAA"], later_than_cached,
+                         batch_size=10, pause_seconds=0)
+    assert "AAA" in res["cached_skip"]
+    assert res["n_fetched"] == 0
+    assert up.calls == 0  # no upstream call at all
+
+    # --- Case 2: user asks for a start EARLIER than what's cached → gap-fill ---
+    earlier_start = (full.index[0] - pd.Timedelta(days=5)).date()
+    up2 = _BoundedFake({"AAA": full})
+    res2 = batch_download(up2, db, ["AAA"], earlier_start,
+                          batch_size=10, pause_seconds=0)
+    assert res2["n_fetched"] == 1, f"expected gap-fill; got {res2}"
+    assert res2["n_cached"] == 0
+    assert "AAA" in res2["fetched"]
+    assert up2.calls >= 1
+    # And our DB now actually has more history than before:
+    assert db.start_date("AAA") <= full.index[0], \
+        f"expected start_date <= {full.index[0]}, got {db.start_date('AAA')}"

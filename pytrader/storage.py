@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pytrader import paths
+
 
 @dataclass
 class RunRecord:
@@ -66,6 +68,10 @@ class PriceStorage(abc.ABC):
                                    Date of the last cached close, or None.
                                    `CachedPriceStore` uses this to decide
                                    whether to hit upstream.
+      start_date(ticker)        -> pd.Timestamp | None
+                                   Date of the earliest cached close, or
+                                   None. Used for gap-fill (see
+                                   CachedPriceStore / batch_download).
       load(ticker)              -> pd.Series
                                    Cached close (full history since first
                                    save). Caller slices to `start` if needed.
@@ -81,6 +87,9 @@ class PriceStorage(abc.ABC):
 
     @abc.abstractmethod
     def end_date(self, ticker: str) -> pd.Timestamp | None: ...
+
+    @abc.abstractmethod
+    def start_date(self, ticker: str) -> pd.Timestamp | None: ...
 
     @abc.abstractmethod
     def load(self, ticker: str) -> pd.Series: ...
@@ -136,8 +145,10 @@ class FeatureStorage(abc.ABC):
 
 
 class DuckDBStore(DB, PriceStorage, FeatureStorage):
-    def __init__(self, path: Path | str = ".pytrader/pytrader.duckdb") -> None:
-        self.path = str(path)
+    def __init__(self, path: Path | str | None = None) -> None:
+        # Default to the canonical, CWD-independent location so every entry
+        # point (download CLI, dashboard, backtest) shares one database.
+        self.path = str(path) if path else str(paths.db_path())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         import duckdb
         self._con = duckdb.connect(self.path)
@@ -255,6 +266,15 @@ class DuckDBStore(DB, PriceStorage, FeatureStorage):
     def end_date(self, ticker: str) -> pd.Timestamp | None:
         row = self._con.execute(
             "SELECT MAX(as_of) FROM market_prices WHERE ticker=?",
+            [ticker],
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return pd.Timestamp(row[0]).normalize()
+
+    def start_date(self, ticker: str) -> pd.Timestamp | None:
+        row = self._con.execute(
+            "SELECT MIN(as_of) FROM market_prices WHERE ticker=?",
             [ticker],
         ).fetchone()
         if row is None or row[0] is None:

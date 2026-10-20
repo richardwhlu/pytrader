@@ -71,7 +71,7 @@ def run_download_cli() -> None:
     if args.benchmark and args.benchmark.upper() not in [t.upper() for t in tickers]:
         tickers = [args.benchmark, *tickers]
 
-    db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
+    db = DuckDBStore()  # canonical shared DB (see pytrader.paths)
     start = date.today() - timedelta(days=int(args.lookback_years * 365.25))
 
     from pytrader.data import YFinanceStore
@@ -81,10 +81,15 @@ def run_download_cli() -> None:
         batch_size=args.batch_size, pause_seconds=args.pause_seconds,
         overwrite=args.overwrite,
     )
+    gap = [t for t in summary["fetched"] if t.upper() in {g.upper() for g in summary.get("gap_fill", [])}]
+    fresh = [t for t in summary["fetched"] if t.upper() not in {g.upper() for g in summary.get("gap_fill", [])}]
     print(f"fetched : {summary['n_fetched']:>4}")
-    if summary["fetched"]:
-        print("          " + ", ".join(summary["fetched"]))
-    print(f"cached  : {summary['n_cached']:>4}  already present")
+    if fresh:
+        print("          " + ", ".join(fresh))
+    if gap:
+        print(f"gap-fill: {len(gap):>3}  (already had newer data, added older history)")
+        print("          " + ", ".join(gap))
+    print(f"cached  : {summary['n_cached']:>4}  already present (no gaps)")
     print(f"failed  : {summary['n_failed']:>4}")
     if summary.get("failed"):
         print("          " + ", ".join(summary["failed"]))
@@ -98,6 +103,63 @@ def run_download_cli() -> None:
                 print(d.format(max_lines=80))
             else:
                 print(d)
+
+
+def run_doctor_cli() -> None:
+    """Detect stray pytrader databases and merge them into the canonical one."""
+    parser = argparse.ArgumentParser(prog="pytrader-doctor")
+    parser.add_argument("--apply", action="store_true",
+                        help="actually perform the merge (default is a dry run)")
+    parser.add_argument("--archive", action="store_true",
+                        help="after merging, move source DBs into a backup dir")
+    args = parser.parse_args()
+
+    from pathlib import Path
+    from pytrader import paths
+    from pytrader.doctor import doctor, migrate, archive
+
+    info = doctor(dry_run=True)
+    print(f"canonical : {info['canonical']}")
+    if not info["orphans"]:
+        print("no stray databases found — the layout is clean. ✅")
+        return
+
+    print(f"stray     : {len(info['orphans'])}")
+    for o in info["orphans"]:
+        print(f"              {o}")
+
+    preview = info.get("merge_preview")
+    if preview is None:
+        print()
+        print("!! Expected one stray DB, but there are "
+              f"{len(info['orphans'])}. Refusing to guess which to merge —")
+        print("!!   inspect them manually and re-run with exactly one present.")
+        return
+
+    total = sum(preview["tables"].values())
+    print()
+    print(f"would merge {total} rows across {len(preview['tables'])} tables:")
+    for t, n in sorted(preview["tables"].items()):
+        print(f"   {t:<16} {n:>8}")
+
+    if not args.apply:
+        print()
+        print("Dry run. Re-run with --apply to merge, and --archive to back up")
+        print("the source databases once you've confirmed the dashboard works.")
+        return
+
+    result = migrate(Path(info["orphans"][0]), dry_run=False)
+    moved = sum(result["tables"].values())
+    print(f"\nMerged {moved} rows into {result['destination']}.")
+
+    if args.archive:
+        arch_dir = paths.data_home() / "archive"
+        moved_paths = archive([Path(o) for o in info["orphans"]], arch_dir)
+        for p in moved_paths:
+            print(f"   archived -> {p}")
+    else:
+        print("\nTip: the source database is left in place. Once the dashboard")
+        print("      shows the data, re-run with --apply --archive to back it up.")
 
 
 if __name__ == "__main__":

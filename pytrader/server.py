@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 
+from pytrader import paths
 from pytrader.config import Config
 from pytrader.data import make_store, PriceStore
 from pytrader.feature_store import FeatureStore
@@ -48,7 +49,7 @@ def create_app(
     )
     cfg = cfg or Config.load()
     if db is None:
-        p = Path(db_path) if db_path else (Path(".pytrader") / "pytrader.duckdb")
+        p = Path(db_path) if db_path else paths.db_path()
         db = DuckDBStore(p)
     if store is None:
         # Wire the price cache over yfinance so repeated runs are cache reads,
@@ -366,7 +367,7 @@ main = run_cli
 def run_backtest_cli(name: str = "cli-run") -> None:
     """One-shot CLI backtest using default config + data (yfinance)."""
     cfg = Config.load()
-    db = DuckDBStore(Path(".pytrader") / "pytrader.duckdb")
+    db = DuckDBStore(paths.db_path())
     store = make_store("yfinance", cache=db)
     p = PipelineConfig.from_config(cfg)
     res = run_strategy(store, cfg, db=db, name=name, pipeline=p,
