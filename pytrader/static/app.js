@@ -33,9 +33,27 @@
     return data;
   }
 
-  function setStatus(node, msg, isErr = false) {
+  function setBusy(node, busy) {
+    if (!node) return;
+    const had = node.querySelector(".spinner");
+    if (busy) {
+      if (had) return;
+      const s = document.createElement("span");
+      s.className = "spinner";
+      s.setAttribute("aria-hidden", "true");
+      node.insertBefore(s, node.firstChild);
+      node.classList.add("busy");
+    } else {
+      if (had) had.remove();
+      node.classList.remove("busy");
+    }
+  }
+
+  function setStatus(node, msg, isErr = false, busy = false) {
+    if (!node) return;
     node.textContent = msg || "";
     node.classList.toggle("err", !!isErr);
+    setBusy(node, busy); // after textContent so the spinner survives
   }
 
   /* ---------- canvas line chart ---------- */
@@ -124,6 +142,25 @@
       }
       ctx.stroke();
     }
+  }
+
+  /* ---------- chart "computing" overlay ---------- */
+  let _overlayEls = new WeakMap(); // box -> {ov, msg}
+  function chartBusy(box, on, label) {
+    if (!box) return;
+    let ref = _overlayEls.get(box);
+    if (on && !ref) {
+      const ov = el("div", "chart-busy hidden");
+      const spin = el("div", "spinner big", null);
+      const msg = el("div", "chart-busy-msg", label || "Computing…");
+      ov.append(spin, msg);
+      box.append(ov);
+      ref = { ov, msg };
+      _overlayEls.set(box, ref);
+    }
+    if (!ref) return;
+    if (label) ref.msg.textContent = label;
+    ref.ov.classList.toggle("hidden", !on);
   }
 
   /* ---------- state ---------- */
@@ -226,7 +263,8 @@
       return;
     }
     empty.classList.add("hidden");
-    setStatus(status, `Loading ${ids.length} run(s)…`);
+    setStatus(status, `Loading ${ids.length} run(s)…`, false, true);
+    chartBusy($("#chart-box"), true, `Fetching ${ids.length} run(s)…`);
     try {
       const data = await api("/api/compare?run_ids=" + ids.join(","));
       const series = [];
@@ -245,9 +283,11 @@
       });
       drawChart($("#equity-chart"), series);
       setStatus(status, "");
+      chartBusy($("#chart-box"), false);
       renderCompare(data.runs);
     } catch (e) {
       setStatus(status, `Chart error: ${e.message}`, true);
+      chartBusy($("#chart-box"), false);
     }
   }
 
@@ -273,7 +313,7 @@
   async function showDetail(runId) {
     const status = $("#detail-status");
     const grid = $("#detail-grid");
-    setStatus(status, "Loading…");
+    setStatus(status, "Loading…", false, true);
     try {
       const r = await api(`/api/runs/${runId}`);
       $("#detail-name").textContent = r.name || runId;
@@ -296,7 +336,7 @@
   async function loadUniverse() {
     const status = $("#universe-status");
     const err = $("#universe-error");
-    setStatus(status, "Loading…");
+    setStatus(status, "Loading…", false, true);
     try {
       const u = await api("/api/universe");
       const sel = u.selected || [];
@@ -349,7 +389,9 @@
         slippage_bps: parseFloat($("#f-slip").value),
       };
       btn.disabled = true;
-      setStatus(status, "Running backtest (training XGBoost + simulating)…");
+      setStatus(status,
+        "Running backtest — training XGBoost, then simulating. " +
+        "This can take a minute…", false, true);
       try {
         const r = await api("/api/backtest", {
           method: "POST",
@@ -372,7 +414,7 @@
   /* ---------- load runs ---------- */
   async function loadRuns() {
     const status = $("#runs-status");
-    setStatus(status, "Loading…");
+    setStatus(status, "Loading…", false, true);
     try {
       const data = await api("/api/runs");
       state.runs = data.runs || [];
@@ -481,7 +523,9 @@
     const start = $("#hist-start").value;
     const horizon = parseInt($("#hist-horizon").value, 10) || 0;
     btn.disabled = true;
-    setStatus(status, "Computing…");
+    const histBox = $("#hist-chart").parentElement;
+    setStatus(status, `Computing ${selected.length} series…`, false, true);
+    chartBusy(histBox, true, `Re-indexing ${selected.length} series…`);
     let result;
     try {
       const qs = new URLSearchParams({ tickers: selected.join(",") });
@@ -490,6 +534,7 @@
       result = await api(`/api/series?${qs.toString()}`);
     } catch (e) {
       setStatus(status, e.message, true);
+      chartBusy(histBox, false);
       btn.disabled = false;
       return;
     }
@@ -574,6 +619,7 @@
       (missing.length ? ` · not cached: ${missing.join(", ")}` : "") +
       (composite ? "" : " · no shared dates for composite"),
       !!missing.length);
+    chartBusy(histBox, false);
     btn.disabled = false;
   }
 
