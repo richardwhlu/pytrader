@@ -145,14 +145,32 @@ class FeatureStorage(abc.ABC):
 
 
 class DuckDBStore(DB, PriceStorage, FeatureStorage):
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(self, path: Path | str | None = None,
+                 read_only: bool = False) -> None:
         # Default to the canonical, CWD-independent location so every entry
         # point (download CLI, dashboard, backtest) shares one database.
         self.path = str(path) if path else str(paths.db_path())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         import duckdb
-        self._con = duckdb.connect(self.path)
-        self._init_schema()
+        self.read_only = read_only
+        try:
+            self._con = duckdb.connect(self.path, read_only=read_only)
+        except Exception as exc:  # noqa: BLE001 - friendly hint for the common case
+            # DuckDB is single-writer: if another process (typically the
+            # dashboard server) holds the write lock, a plain message is
+            # easy to misread.
+            if "lock" in str(exc).lower():
+                mode = "read-only" if read_only else "for writing"
+                tip = ("The dashboard server holds the same database; "
+                       "stop it (Ctrl-C the `pytrader-server` process) "
+                       "and try again.")
+                raise RuntimeError(
+                    f"Could not open {self.path} {mode}: {exc}\n\n"
+                    f"{tip}"
+                ) from exc
+            raise
+        if not read_only:
+            self._init_schema()
 
     def _init_schema(self) -> None:
         c = self._con

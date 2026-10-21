@@ -35,11 +35,22 @@ def create_app(
 ) -> Flask:
     """Create the Flask app.
 
-    Injection points for tests / future platform changes:
-      * ``cfg``    — user config (defaults to ``Config.load()``)
-      * ``store``  — price data source (defaults to yfinance)
-      * ``db``     — run repository (defaults to DuckDB under .pytrader/)
-      * ``db_path``— alternate location for the DuckDB store
+    **Concurrency model**
+    DuckDB is single-process: any connection (read-only or read-write)
+    held for the life of the process blocks every other process that
+    tries to open the same DB — including the ``pytrader-download`` and
+    ``pytrader-backtest`` CLIs. To let the dashboard and the CLIs coexist,
+    this app opens a *fresh* ``DuckDBStore`` per request and closes it
+    before returning. Between requests no lock is held on the DB, so a
+    CLI can always run.
+
+    Injection points for tests:
+      * ``cfg``     — user config (defaults to ``Config.load()``)
+      * ``store``   — price data source (defaults to yfinance)
+      * ``db``      — read-only price/run repository. Inject a live
+                      ``DuckDBStore`` to bypass the per-request opening
+                      (hermetic tests do this).
+      * ``db_path`` — alternate DB location
     """
     static = Path(__file__).parent / "static"
     app = Flask(
@@ -48,13 +59,34 @@ def create_app(
         static_url_path="/static",
     )
     cfg = cfg or Config.load()
-    if db is None:
-        p = Path(db_path) if db_path else paths.db_path()
-        db = DuckDBStore(p)
-    if store is None:
-        # Wire the price cache over yfinance so repeated runs are cache reads,
-        # not network calls. `db` doubles as PriceStorage.
-        store = make_store("yfinance", cache=db)
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _store_ctx(read_only: bool = True):
+        """Yield ``(store, db)`` for one request.
+
+        DuckDB is single-process: an **open** connection (read-only or
+        read-write) blocks any other process from opening the same
+        database — including our own ``pytrader-download`` and
+        ``pytrader-backtest`` CLIs. So the app opens a **fresh**
+        ``DuckDBStore`` per request and closes it before the response
+        is sent. Between requests no lock is held, so the CLI can
+        always proceed.
+
+        If the caller injected ``db`` (hermetic tests), we honour it
+        and don't open a separate handle.
+        """
+        if db is not None:
+            _s = store if store is not None else make_store("yfinance")
+            yield (_s, db)
+            return
+        p = Path(db_path) if db_path else None
+        d = DuckDBStore(p, read_only=read_only)
+        s = make_store("yfinance", cache=d) if store is None else store
+        try:
+            yield (s, d)
+        finally:
+            d.close()
 
     @app.get("/")
     def index():  # type: ignore[return]
@@ -67,13 +99,14 @@ def create_app(
     @app.get("/api/universe")
     def universe():
         from pytrader.universe import TickerInfo
-        meta = store.metadata(cfg.include)
-        cand = {
-            t: TickerInfo(t, meta.get(t, {}).get("name", t),
-                          meta.get(t, {}).get("sector", ""))
-            for t in cfg.include
-        }
-        sel, rej = _resolve(cand, cfg)
+        with _store_ctx(read_only=True) as (st, _):
+            meta = st.metadata(cfg.include)
+            cand = {
+                t: TickerInfo(t, meta.get(t, {}).get("name", t),
+                              meta.get(t, {}).get("sector", ""))
+                for t in cfg.include
+            }
+            sel, rej = _resolve(cand, cfg)
         return jsonify({
             "benchmark": cfg.benchmark,
             "selected": [
@@ -96,16 +129,17 @@ def create_app(
         Returns sorted tickers + their cached name/sector/end_date so the
         picker can render readable rows without an extra round-trip per row.
         """
-        out = []
-        for t in db.tickers():
-            meta = db.load_meta(t) or {}
-            end = db.end_date(t)
-            out.append({
-                "ticker": t,
-                "name": meta.get("name", t),
-                "sector": meta.get("sector", ""),
-                "end_date": end.date().isoformat() if end is not None else None,
-            })
+        with _store_ctx(read_only=True) as (_, db_):
+            out = []
+            for t in db_.tickers():
+                meta = db_.load_meta(t) or {}
+                end = db_.end_date(t)
+                out.append({
+                    "ticker": t,
+                    "name": meta.get("name", t),
+                    "sector": meta.get("sector", ""),
+                    "end_date": end.date().isoformat() if end is not None else None,
+                })
         return jsonify({"tickers": out})
 
     @app.get("/api/series")
@@ -159,45 +193,46 @@ def create_app(
         # the global earliest/latest close so the UI has the bounds.
         global_earliest: pd.Timestamp | None = None
         global_latest: pd.Timestamp | None = None
-        for t in tickers:
-            s: pd.Series | None = db.load(t)
-            if s is None or len(s) == 0:
-                missing.append(t)
-                continue
-            if start_ts is not None:
-                s = s.loc[s.index >= start_ts]
-                if len(s) == 0:
-                    # Nothing after start_date — treat as missing.
+        with _store_ctx(read_only=True) as (_, db):
+            for t in tickers:
+                s: pd.Series | None = db.load(t)
+                if s is None or len(s) == 0:
                     missing.append(t)
                     continue
-                base = s.iloc[0]
-            else:
-                base = s.iloc[0]
-            if base <= 0:
-                # Can't reindex against a non-positive price.
-                missing.append(t)
-                continue
-            # Percent gain from the base day: 0% on the base day itself.
-            gain = (s / base - 1.0) * 100.0
-            # Cap the window at `horizon` trading days from the base.
-            if horizon > 0:
-                gain = gain.iloc[:horizon]
-            end_close = float(s.loc[gain.index[-1]])
-            # Update global bounds.
-            e, l = gain.index[0], gain.index[-1]
-            global_earliest = e if global_earliest is None else min(global_earliest, e)
-            global_latest = l if global_latest is None else max(global_latest, l)
-            meta = db.load_meta(t) or {}
-            out_series[t] = {
-                "name": meta.get("name", t),
-                "sector": meta.get("sector", ""),
-                "base_date": gain.index[0].date().isoformat(),
-                "base_close": float(base),
-                "end_close": end_close,
-                "end_pct": float(gain.iloc[-1]),   # % change base→end
-                "points": [[d.date().isoformat(), float(v)]
-                           for d, v in list(gain.items())],
-            }
+                if start_ts is not None:
+                    s = s.loc[s.index >= start_ts]
+                    if len(s) == 0:
+                        # Nothing after start_date — treat as missing.
+                        missing.append(t)
+                        continue
+                    base = s.iloc[0]
+                else:
+                    base = s.iloc[0]
+                if base <= 0:
+                    # Can't reindex against a non-positive price.
+                    missing.append(t)
+                    continue
+                # Percent gain from the base day: 0% on the base day itself.
+                gain = (s / base - 1.0) * 100.0
+                # Cap the window at `horizon` trading days from the base.
+                if horizon > 0:
+                    gain = gain.iloc[:horizon]
+                end_close = float(s.loc[gain.index[-1]])
+                # Update global bounds.
+                e, l = gain.index[0], gain.index[-1]
+                global_earliest = e if global_earliest is None else min(global_earliest, e)
+                global_latest = l if global_latest is None else max(global_latest, l)
+                meta = db.load_meta(t) or {}
+                out_series[t] = {
+                    "name": meta.get("name", t),
+                    "sector": meta.get("sector", ""),
+                    "base_date": gain.index[0].date().isoformat(),
+                    "base_close": float(base),
+                    "end_close": end_close,
+                    "end_pct": float(gain.iloc[-1]),   # % change base→end
+                    "points": [[d.date().isoformat(), float(v)]
+                               for d, v in list(gain.items())],
+                }
         return jsonify({
             "start": global_earliest.date().isoformat() if global_earliest else None,
             "end": global_latest.date().isoformat() if global_latest else None,
@@ -207,54 +242,56 @@ def create_app(
 
     @app.get("/api/runs")
     def runs():
-        recs = db.list_runs()
-        out = []
-        for r in recs:
-            m = r.metrics.get("metrics", r.metrics)
-            out.append({
-                "run_id": r.run_id,
-                "name": r.name,
-                "created_at": r.created_at,
-                "metrics": {
-                    "sharpe": m.get("sharpe", 0),
-                    "cagr": m.get("cagr", 0),
-                    "max_drawdown": m.get("max_drawdown", 0),
-                    "total_return": m.get("total_return", 0),
-                    "ann_vol": m.get("ann_vol", 0),
-                    "hit_rate": m.get("hit_rate", 0),
-                    "sortino": m.get("sortino", 0),
-                    "avg_turnover": m.get("avg_turnover", 0),
-                    "train_ic": m.get("train_ic", 0),
-                    "valid_ic": m.get("valid_ic", 0),
-                    "benchmark_ir": m.get("benchmark_ir", 0),
-                    "n_days": m.get("n_days", 0),
-                    "n_tickers": r.config.get("n_tickers", 0),
-                },
-            })
+        with _store_ctx(read_only=True) as (_, db_):
+            recs = db_.list_runs()
+            out = []
+            for r in recs:
+                m = r.metrics.get("metrics", r.metrics)
+                out.append({
+                    "run_id": r.run_id,
+                    "name": r.name,
+                    "created_at": r.created_at,
+                    "metrics": {
+                        "sharpe": m.get("sharpe", 0),
+                        "cagr": m.get("cagr", 0),
+                        "max_drawdown": m.get("max_drawdown", 0),
+                        "total_return": m.get("total_return", 0),
+                        "ann_vol": m.get("ann_vol", 0),
+                        "hit_rate": m.get("hit_rate", 0),
+                        "sortino": m.get("sortino", 0),
+                        "avg_turnover": m.get("avg_turnover", 0),
+                        "train_ic": m.get("train_ic", 0),
+                        "valid_ic": m.get("valid_ic", 0),
+                        "benchmark_ir": m.get("benchmark_ir", 0),
+                        "n_days": m.get("n_days", 0),
+                        "n_tickers": r.config.get("n_tickers", 0),
+                    },
+                })
         return jsonify({"runs": out})
 
     @app.get("/api/runs/<run_id>")
     def run_detail(run_id: str):
-        r = db.get_run(run_id)
-        if r is None:
-            return jsonify({"error": "run not found"}), 404
-        eq = db.get_equity(run_id)
-        if eq is None:
-            return jsonify({"error": "run found but no equity data"}), 500
-        eq_list = [
-            [int(ts.timestamp() * 1000),
-             _f("equity", eq, ts),
-             _f("benchmark_equity", eq, ts)]
-            for ts in eq.index
-        ]
-        return jsonify({
-            "run_id": r.run_id,
-            "name": r.name,
-            "created_at": r.created_at,
-            "metrics": r.metrics,
-            "config": r.config,
-            "equity": eq_list,
-        })
+        with _store_ctx(read_only=True) as (_, db_):
+            r = db_.get_run(run_id)
+            if r is None:
+                return jsonify({"error": "run not found"}), 404
+            eq = db_.get_equity(run_id)
+            if eq is None:
+                return jsonify({"error": "run found but no equity data"}), 500
+            eq_list = [
+                [int(ts.timestamp() * 1000),
+                 _f("equity", eq, ts),
+                 _f("benchmark_equity", eq, ts)]
+                for ts in eq.index
+            ]
+            return jsonify({
+                "run_id": r.run_id,
+                "name": r.name,
+                "created_at": r.created_at,
+                "metrics": r.metrics,
+                "config": r.config,
+                "equity": eq_list,
+            })
 
     @app.get("/api/compare")
     def compare():
@@ -263,30 +300,31 @@ def create_app(
         if not ids:
             return jsonify({"error": "run_ids required"}), 400
         out = []
-        for rid in ids[:10]:
-            r = db.get_run(rid)
-            if r is None:
-                continue
-            eq = db.get_equity(rid)
-            if eq is None:
-                continue
-            equity = [
-                [int(ts.timestamp() * 1000), _f("equity", eq, ts)]
-                for ts in eq.index
-            ]
-            bench = [
-                [int(ts.timestamp() * 1000), _f("benchmark_equity", eq, ts)]
-                for ts in eq.index if _f("benchmark_equity", eq, ts) is not None
-            ]
-            m = r.metrics.get("metrics", r.metrics)
-            out.append({
-                "run_id": rid, "name": r.name, "created_at": r.created_at,
-                "metrics": m,
-                "equity": equity,
-                "benchmark_equity": bench,
-                "n_days": m.get("n_days", 0),
-                "n_tickers": r.config.get("n_tickers", 0),
-            })
+        with _store_ctx(read_only=True) as (_, db_):
+            for rid in ids[:10]:
+                r = db_.get_run(rid)
+                if r is None:
+                    continue
+                eq = db_.get_equity(rid)
+                if eq is None:
+                    continue
+                equity = [
+                    [int(ts.timestamp() * 1000), _f("equity", eq, ts)]
+                    for ts in eq.index
+                ]
+                bench = [
+                    [int(ts.timestamp() * 1000), _f("benchmark_equity", eq, ts)]
+                    for ts in eq.index if _f("benchmark_equity", eq, ts) is not None
+                ]
+                m = r.metrics.get("metrics", r.metrics)
+                out.append({
+                    "run_id": rid, "name": r.name, "created_at": r.created_at,
+                    "metrics": m,
+                    "equity": equity,
+                    "benchmark_equity": bench,
+                    "n_days": m.get("n_days", 0),
+                    "n_tickers": r.config.get("n_tickers", 0),
+                })
         return jsonify({"runs": out})
 
     @app.post("/api/backtest")
@@ -318,9 +356,14 @@ def create_app(
         name = str(body.get("name", "")).strip() or f"run-{p.run_id if hasattr(p, 'run_id') else 'inline'}"
         try:
             from pytrader.storage import FeatureStorage as _FS
-            fs = FeatureStore(db) if isinstance(db, _FS) else None
-            res = run_strategy(store, cfg, db=db, name=name, pipeline=p,
-                               feature_store=fs)
+            # Backtests must **write** (run + equity + feature cache), so
+            # use a writable connection — even though the app's default is
+            # read-only, since a read-only connection would break the
+            # write path and leave no lock held on any subsequent request.
+            with _store_ctx(read_only=False) as (st, db_):
+                fs = FeatureStore(db_) if isinstance(db_, _FS) else None
+                res = run_strategy(st, cfg, db=db_, name=name, pipeline=p,
+                                   feature_store=fs)
         except Exception as e:  # noqa: BLE001
             import traceback as _tb
             # Surface the full stack in the JSON so a browser-side error has a

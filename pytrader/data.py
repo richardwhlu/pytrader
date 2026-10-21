@@ -149,7 +149,12 @@ class CachedPriceStore(PriceStore):
                 upstream = self._upstream.metadata([t])[t.upper()]
             except Exception:  # noqa: BLE001 — metadata is best-effort
                 upstream = {"name": t, "sector": ""}
-            self._cache.save_meta(t.upper(), upstream)
+            try:
+                self._cache.save_meta(t.upper(), upstream)
+            except Exception:
+                # read-only connection (server mode) or disk issue —
+                # still serve the metadata to the caller.
+                pass
             out[t.upper()] = upstream
         return out
 
