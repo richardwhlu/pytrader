@@ -538,7 +538,29 @@
       btn.disabled = false;
       return;
     }
-    histResult = result;
+    btn.disabled = false; // re-enable early; the render below is synchronous & fast
+    try {
+      histResult = result;
+      await renderHist(result);
+    } catch (e) {
+      // A render-stage throw (e.g. a chart bug) used to escape all the way up,
+      // leaving the spinner up and the button disabled — which looked like an
+      // endless "Computing…". Surface it and clear the overlay instead.
+      console.error("historical render failed", e);
+      setStatus(status, `Render error: ${e.message || e}`, true);
+      chartBusy($("#hist-chart").parentElement, false);
+      btn.disabled = false;
+    }
+  }
+
+  // Synchronous client-side render of a /api/series result. Split from
+  // generateHist() so any exception is caught and reported instead of
+  // leaving the UI frozen.
+  async function renderHist(result) {
+    const status = $("#hist-status");
+    const btn = $("#hist-go");
+    const selected = histSelected();
+    const histBox = $("#hist-chart").parentElement;
     const norm = effectiveWeights(selected);
     const composite = computeComposite(selected, result, norm);
 
