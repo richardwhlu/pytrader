@@ -11,7 +11,9 @@ from typing import Any
 
 import yaml
 
-DEFAULT_HOME = Path(".pytrader")
+from pytrader import paths
+
+DEFAULT_HOME = paths.data_home()
 
 
 @dataclass

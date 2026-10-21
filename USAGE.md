@@ -291,6 +291,16 @@ uv run python -c "from pytrader.strategy import run_strategy; ..."
 - **Faith screen metadata** is coarse (yfinance sectors); the owner-curated
   `faith_blocklist.yaml` is the intended long-term source.
 - **Rate limits** are per-IP and soft; the cache is what keeps re-runs free.
+- **DuckDB is single-process (single-writer across processes).** The dashboard
+  opens a fresh connection per request and closes it before returning, so the
+  dashboard and the CLIs can run at the same time. But only one *writer* can
+  be active at a moment — don't run two downloads at once, and don't start a
+  backtest while a download is mid-flight.
+- **A long-lived connection holds the DB lock for its whole life.** If you
+  start a long-running Python process that opens the DB and then forget to
+  close it, everything that needs to write blocks until that process dies.
+  Kill anything you don't need with `pkill -f pytrader-serve` (or restart
+  the dashboard) before trying to write to the same file.
 
 ---
 
