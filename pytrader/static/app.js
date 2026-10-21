@@ -60,7 +60,12 @@
   const PALETTE = ["#4f8cff", "#f59e0b", "#22c55e", "#ec4899",
                    "#8b5cf6", "#14b8a6", "#ef4444", "#eab308"];
 
-  function drawChart(canvas, seriesList) {
+  function drawChart(canvas, seriesList, opts = {}) {
+    // opts.zeroAnchor: force the y-domain to include 0 and pad it with 10%
+    // of the data span on each side, so a 0% baseline reads as the
+    // "starts here" reference for re-indexed (pct-gain) charts. Drawn with
+    // a distinct dashed accent-colored baseline.
+    const zeroAnchor = !!opts.zeroAnchor;
     // seriesList: [{label, color, points:[{t, v}]}...]
     const dpr = window.devicePixelRatio || 1;
     const cssW = canvas.clientWidth || 800;
@@ -69,7 +74,10 @@
     canvas.height = cssH * dpr;
     const ctx = canvas.getContext("2d");
     ctx.scale(dpr, dpr);
-    const pad = { l: 56, r: 16, t: 16, b: 28 };
+    // Extra bottom padding when we need rotated date labels (xRot is always
+    // true in practice for now; keep the knob in case we add a mode later).
+    const xRot = true;
+    const pad = { l: 56, r: 16, t: 16, b: xRot ? 48 : 28 };
 
     // flatten points to find domains
     let tMin = Infinity, tMax = -Infinity, vMin = Infinity, vMax = -Infinity;
@@ -84,46 +92,90 @@
     }
     ctx.clearRect(0, 0, cssW, cssH);
     if (!allPoints.length) return;
-    if (vMax - vMin < 1e-9) { vMin -= 0.05; vMax += 0.05; }
-    const vSpan = vMax - vMin;
-    vMin -= vSpan * 0.05; vMax += vSpan * 0.05;
+
+    let yLo = vMin, yHi = vMax;
+    if (zeroAnchor) {
+      // Re-indexed (pct-gain) chart. Per your request: make 0% obvious and
+      // anchor it roughly in the middle of the plot. Center 0% symmetrically —
+      // the side that actually has data fills its half, the empty half is
+      // headroom. 10% padding so no line sits glued to the top/bottom edge.
+      const M = Math.max(Math.abs(vMin), Math.abs(vMax), 1e-9);
+      yHi = M * 1.10;
+      yLo = -M * 1.10;
+    } else {
+      if (yHi - yLo < 1e-9) { yLo -= 0.05; yHi += 0.05; }
+      const span = yHi - yLo;
+      yLo -= span * 0.05; yHi += span * 0.05;
+    }
     if (tMax - tMin < 1) tMax = tMin + 1;
 
     const plotW = cssW - pad.l - pad.r;
     const plotH = cssH - pad.t - pad.b;
     const xOf = (t) => pad.l + ((t - tMin) / (tMax - tMin)) * plotW;
-    const yOf = (v) => pad.t + (1 - (v - vMin) / (vMax - vMin)) * plotH;
+    const yOf = (v) => pad.t + (1 - (v - yLo) / (yHi - yLo)) * plotH;
 
-    // style
+    // style constants
     const gridColor = "rgba(255,255,255,0.07)";
-    const axisColor = "rgba(255,255,255,0.45)";
-    ctx.font = "11px -apple-system, system-ui, sans-serif";
+    const axisColor = "rgba(255,255,255,0.55)";
+    const accent = "#4f8cff";
 
-    // horizontal gridlines (5)
-    const nGrid = 4;
-    for (let i = 0; i <= nGrid; i++) {
-      const v = vMin + (i / nGrid) * (vMax - vMin);
+    // horizontal gridlines at "nice" round numbers. For a zero-anchored
+    // chart the domain is symmetric about 0, so 0 is always one of the
+    // ticks and gets drawn as the distinct dashed accent baseline.
+    function niceStep(span, target) {
+      const raw = span / Math.max(1, target);
+      const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+      const norm = raw / mag;
+      let step;
+      if (norm < 1.5) step = 1; else if (norm < 3) step = 2;
+      else if (norm < 7) step = 5; else step = 10;
+      return step * mag;
+    }
+    const step = niceStep(yHi - yLo, 5);
+    const first = Math.ceil(yLo / step) * step;
+    const ticksY = [];
+    for (let v = first; v <= yHi + step * 1e-6; v += step) ticksY.push(v);
+
+    ctx.font = "11px -apple-system, system-ui, sans-serif";
+    for (const v of ticksY) {
       const y = yOf(v);
-      ctx.strokeStyle = gridColor;
-      ctx.lineWidth = 1;
+      const isZero = zeroAnchor && Math.abs(v) < step * 1e-4;
+      ctx.strokeStyle = isZero ? accent : gridColor;
+      ctx.lineWidth = isZero ? 1.5 : 1;
+      if (isZero) ctx.setLineDash([4, 3]); else ctx.setLineDash([]);
       ctx.beginPath();
       ctx.moveTo(pad.l, y);
       ctx.lineTo(cssW - pad.r, y);
       ctx.stroke();
-      ctx.fillStyle = axisColor;
+      ctx.setLineDash([]);
+      ctx.fillStyle = isZero ? accent : axisColor;
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
-      ctx.fillText(v.toFixed(2), pad.l - 6, y);
+      const label = zeroAnchor
+        ? (Math.round(v * 100) / 100).toString()
+        : v.toFixed(2);
+      ctx.fillText(label, pad.l - 6, y);
     }
-    // x ticks (first, mid, last as dates)
-    const dates = [tMin, (tMin + tMax) / 2, tMax];
-    for (const t of dates) {
+
+    // x ticks — rotated -35°, roughly 5–6 labels across the plot width
+    const tSpan = tMax - tMin;
+    const targetTicks = 6;
+    const tickStep = tSpan / Math.max(1, targetTicks - 1);
+    const ticks = [];
+    for (let i = 0; i < targetTicks; i++) ticks.push(tMin + i * tickStep);
+    const ang = -Math.PI / 6;   // -30°, close to 45° but readable
+    for (const t of ticks) {
       const x = xOf(t);
-      ctx.fillStyle = axisColor;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
       const d = new Date(t);
-      ctx.fillText(d.toLocaleDateString(), x, cssH - pad.b + 6);
+      const label = d.toLocaleDateString();
+      ctx.save();
+      ctx.translate(x, cssH - pad.b + 8);
+      ctx.rotate(ang);
+      ctx.fillStyle = axisColor;
+      ctx.textAlign = "right";             // anchor: text right end at the tick
+      ctx.textBaseline = "middle";
+      ctx.fillText(label, 0, 0);
+      ctx.restore();
     }
 
     // lines
@@ -580,7 +632,7 @@
       });
     }
     $("#hist-chart-empty").classList.add("hidden");
-    drawChart($("#hist-chart"), seriesList);
+    drawChart($("#hist-chart"), seriesList, { zeroAnchor: true });
 
     // ----- legend -----
     const legend = $("#hist-legend");
