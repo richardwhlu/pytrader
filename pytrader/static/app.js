@@ -79,7 +79,7 @@
         if (!Number.isFinite(p.v)) continue;
         allPoints.push(p);
         tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t);
-        vMin = Math.min(vMin, p.v); vMax = Math.max(vMax, v.v);
+        vMin = Math.min(vMin, p.v); vMax = Math.max(vMax, p.v);
       }
     }
     ctx.clearRect(0, 0, cssW, cssH);
