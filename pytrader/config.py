@@ -81,11 +81,17 @@ class Config:
     @classmethod
     def default(cls) -> "Config":
         c = cls()
-        c.include = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "AVGO", "NFLX"]
-        c.include += ["CRM", "ADBE", "ORCL", "CSCO", "AMD", "QCOM", "TXN", "MU"]
-        c.include += ["XOM", "CVX", "LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE"]
-        c.include += ["JPM", "BAC", "V", "MA", "C", "HD", "COST", "WMT"]
-        c.include += ["UPS", "CAT", "GE", "HON", "LOW", "TGT", "MCD", "SBUX"]
+        # Default universe = the user's current tracked holdings. To change
+        # the tracked universe without editing code, edit `include` in
+        # .pytrader/config.yaml instead (see the module docstring).
+        c.include = [
+            "ADBE", "GOOGL", "GOOG", "AMZN", "AMD", "AAPL", "BCPC", "BRK.B",
+            "BKNG", "CASY", "CBOE", "CMG", "CTAS", "COST", "CRWD", "DDOG",
+            "ELF", "ECL", "EQT", "GRAB", "HEI", "IDXX", "PI", "IBKR",
+            "KMI", "KNSL", "MKC", "MCK", "MELI", "META", "MSFT", "NICE",
+            "NVO", "NVDA", "ODFL", "RPM", "NOW", "SHW", "SHOP", "TTD",
+            "TDG", "UNH", "WSO", "WSM", "PGR", "VLTO", "WING", "KD", "PSTG",
+        ]
         c.exclude = ["SMCI", "PLUG", "RIVN", "LCID", "BYND"]  # example exclusions
         return c
 
