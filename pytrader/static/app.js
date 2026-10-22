@@ -545,6 +545,7 @@
     const list = $("#hist-ticker-list");
     const noCache = $("#hist-no-cache");
     list.innerHTML = "";
+    historyChipEls.clear();
     try {
       const data = await api("/api/tickers");
       histTickers = (data.tickers || []).slice().sort((a, b) =>
@@ -555,16 +556,82 @@
         const row = el("label", "hist-row");
         const cb = document.createElement("input");
         cb.type = "checkbox"; cb.value = t.ticker;
+        // Lowercased haystack for the filter (ticker + name).
+        row.dataset.search = (t.ticker + " " + (t.name || "")).toLowerCase();
         row.append(cb, el("span", "tk", t.ticker), el("span", "nm", t.name),
                    el("span", "end", t.end_date || ""));
         list.append(row);
+        // Chip registry: ticker -> chip element, for O(1) show/hide.
+        const chip = el("span", "chip");
+        chip.dataset.ticker = t.ticker;
+        const rm = el("button", null, "×");
+        rm.type = "button"; rm.setAttribute("aria-label", "Remove " + t.ticker);
+        rm.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const box = list.querySelector(
+            `input[value="${t.ticker}"]`);
+          if (box) box.checked = false;
+        });
+        appendChip(t.ticker, chip, rm);
       }
       // Sensible defaults: check up to the first 4 tickers.
       const boxes = [...list.querySelectorAll("input[type=checkbox]")];
       boxes.slice(0, Math.min(4, boxes.length)).forEach((b) => (b.checked = true));
+      applyFilter();
+      refreshSelectionUI();
     } catch (e) {
       noCache.textContent = `Could not load cached tickers: ${e.message}`;
     }
+  }
+
+  // ---- selection UI: chips + count + filtered state ----
+  // ticker -> chip wrapper element. Kept in a Map (not in the DOM) so
+  // we can order/show-hide chips in O(selected) without scanning.
+  const historyChipEls = new Map();
+
+  function appendChip(ticker, chip, rmBtn) {
+    chip.append(document.createTextNode(ticker), rmBtn);
+    $("#hist-chips").append(chip);
+    historyChipEls.set(ticker, chip);
+    // Start hidden; loadHistTickers runs refreshSelectionUI() at the end
+    // and will reveal chips for the default-checked tickers only.
+    chip.classList.add("hidden-chip");
+  }
+
+  function refreshSelectionUI() {
+    const chips = $("#hist-chips");
+    const selected = histSelected();
+    const selSet = new Set(selected);
+
+    // Chips stay in the DOM always (one per available ticker); we just
+    // toggle visibility. That's O(tickers) regardless of selection size
+    // and avoids the DOM churn of append/remove per change. The visual
+    // order matches selection order (insertion order is stable per
+    // loadHistTickers, which sorts tickers alphabetically — that's the
+    // same order the checkboxes appear in, so it reads naturally).
+    for (const [t, chip] of historyChipEls) {
+      chip.classList.toggle("hidden-chip", !selSet.has(t));
+    }
+
+    // Count line.
+    $("#hist-count").textContent =
+      `${selected.length} selected` +
+      (selected.length ? ` (${histTickers.length} available)` : "");
+    return selected.length;
+  }
+
+  function applyFilter() {
+    const q = ($("#hist-filter")?.value || "").trim().toLowerCase();
+    const list = $("#hist-ticker-list");
+    const rows = [...list.querySelectorAll(".hist-row")];
+    let visible = 0;
+    for (const row of rows) {
+      const match = !q || (row.dataset.search || "").includes(q);
+      row.classList.toggle("hidden-row", !match);
+      if (match) visible++;
+    }
+    $("#hist-empty-filter").hidden = !(q && visible === 0);
+    return visible;
   }
 
   async function generateHist() {
@@ -700,18 +767,53 @@
   function bindHistorical() {
     const list = $("#hist-ticker-list");
     const go = $("#hist-go");
-    const update = () => { go.disabled = histSelected().length === 0; };
-    list.addEventListener("change", update);
+    const filter = $("#hist-filter");
+    let tId = null;                // debounce timer
+
+    const schedule = (fn, ms = 120) => {
+      if (tId) clearTimeout(tId);
+      tId = setTimeout(() => { tId = null; fn(); }, ms);
+    };
+
+    const revalidate = () => {
+      refreshSelectionUI();
+      go.disabled = histSelected().length === 0;
+    };
+
+    // Checkbox change -> refresh chips + count + go-button.
+    list.addEventListener("change", revalidate);
+
+    // Filter input -> hide non-matching rows (debounced so we don't
+    // re-do the work for each keystroke on a large list).
+    if (filter) {
+      filter.addEventListener("input", schedule(() => {
+        applyFilter();
+        // Chips are unchanged (they're independent of the filter), but the
+        // "matches nothing" empty-state needs to be up to date.
+      }, 80));
+    }
+
     go.addEventListener("click", generateHist);
+
+    // "Select all" = set every *visible* row's checkbox. If a filter is
+    // active, that's only the matching rows; otherwise, all of them.
     $("#hist-all").addEventListener("click", () => {
-      list.querySelectorAll("input[type=checkbox]").forEach((b) => (b.checked = true));
-      update();
+      [...list.querySelectorAll(".hist-row")]
+        .filter((r) => !r.classList.contains("hidden-row"))
+        .forEach((r) => { r.querySelector("input").checked = true; });
+      revalidate();
     });
+    // "Clear" = uncheck every checkbox (selected or not). Chips and the
+    // filter follow along in revalidate().
     $("#hist-none").addEventListener("click", () => {
-      list.querySelectorAll("input[type=checkbox]").forEach((b) => (b.checked = false));
-      update();
+      list.querySelectorAll("input[type=checkbox]")
+            .forEach((b) => (b.checked = false));
+      revalidate();
     });
-    update();
+
+    // If the user typed in the filter but no row matched, still let them
+    // see the "no matches" hint even if chips are still set.
+    revalidate();
   }
 
   /* ---------- boot ---------- */
