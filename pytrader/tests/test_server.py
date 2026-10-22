@@ -354,3 +354,16 @@ def test_optimize_recommended_at_requested_lambda(price_db, cfg):
             # recommended weights are always feasible.
             assert sum(body["recommended"]["weights"].values()) == pytest.approx(
                 1.0, abs=1e-5)
+
+
+def test_optimize_single_point_with_steps_param_ok(price_db, cfg):
+    """The front-end always sends a `steps` param; in single-point mode the
+    server must ignore it (not reject it). A regression for a 400 that used
+    to fire when steps=1 was passed alongside a scalar risk_aversion."""
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        for steps in ("1", "2", "10"):
+            r = c.get(f"/api/optimize?tickers=A,B&risk_aversion=1&steps={steps}")
+            assert r.status_code == 200, steps
+            assert len(r.get_json()["points"]) == 1

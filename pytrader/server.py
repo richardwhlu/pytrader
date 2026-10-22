@@ -306,15 +306,18 @@ def create_app(
                 return jsonify({"error": "risk_aversion must be ≥ 0"}), 400
 
         want_frontier = (request.args.get("frontier") or "").lower() in ("1", "true", "yes")
-        steps_raw = request.args.get("steps")
+        # steps only applies to frontier mode; single-point mode ignores it,
+        # so it's only validated when we actually need it.
         steps: int | None = None
-        if steps_raw is not None:
-            try:
-                steps = int(steps_raw)
-            except ValueError:
-                return jsonify({"error": "steps must be an integer ≥ 2"}), 400
-            if steps < 2:
-                return jsonify({"error": "steps must be ≥ 2"}), 400
+        if want_frontier:
+            steps_raw = request.args.get("steps")
+            if steps_raw is not None:
+                try:
+                    steps = int(steps_raw)
+                except ValueError:
+                    return jsonify({"error": "steps must be an integer ≥ 2"}), 400
+                if steps < 2:
+                    return jsonify({"error": "steps must be ≥ 2"}), 400
 
         # Build the closes DataFrame from the cache.
         series_map: dict[str, pd.Series] = {}

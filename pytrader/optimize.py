@@ -193,11 +193,16 @@ def optimize_window(
     w = _solve(mu, cov, float(risk_aversion))
 
     # Realized stats from the daily-rebalanced constant-weight equity curve.
+    # `port` has one entry per trading-day step; len(port) is the window length
+    # (e.g. 60 closing prices → 59 trading-day steps). n_days == len(port).
     port = rets.to_numpy(dtype="float64") @ w
     equity = np.cumprod(1.0 + port)
     n = len(equity)
-    total = float(equity[-1] / equity[0] - 1.0) if n > 1 else 0.0
-    ann_ret = float(equity[-1] ** (TRADING_DAYS / max(1, n - 1)) - 1.0) if n > 1 and equity[-1] > 0 else 0.0
+    total = float(equity[-1] - 1.0) if n > 0 else 0.0
+    if n > 0 and equity[-1] > 0:
+        ann_ret = float(equity[-1] ** (TRADING_DAYS / n) - 1.0)
+    else:
+        ann_ret = 0.0
     sd = float(np.std(port, ddof=1)) if n >= 2 else 0.0
     ann_vol = sd * math.sqrt(TRADING_DAYS)
     sharpe = (float(np.mean(port) / sd) * math.sqrt(TRADING_DAYS)) if sd > 0 else 0.0
@@ -214,7 +219,7 @@ def optimize_window(
         ann_vol=ann_vol,
         sharpe=sharpe,
         max_drawdown=mdd,
-        n_days=max(0, n - 1),
+        n_days=n,
         n_positions=int((w > 1e-9).sum()),
     )
 
