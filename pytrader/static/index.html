@@ -76,7 +76,21 @@
           <!-- Controls -->
           <div class="card hist-controls">
             <h3>Select tickers</h3>
+
+            <!-- Chips: what's actually selected. Compact, always visible,
+                 removable with one click. The full list below stays scrollable. -->
+            <div class="hist-chips" id="hist-chips" aria-label="Selected tickers"></div>
+
+            <!-- Searchable list. Filter by ticker or name (case-insensitive).
+                 Rows that don't match the filter are hidden; "Select all"
+                 applies only to the *visible* set. -->
+            <input type="search" id="hist-filter"
+                   class="hist-filter"
+                   placeholder="Filter tickers…"
+                   aria-label="Filter tickers"
+                   autocomplete="off" spellcheck="false">
             <div class="hist-rows" id="hist-ticker-list" aria-label="Tickers"></div>
+            <div class="hint" id="hist-empty-filter" hidden>No matched tickers.</div>
             <div class="hint" id="hist-no-cache">
               No cached prices yet. Run <code>pytrader-download</code> first —
               or pick a small universe and try again.
@@ -85,6 +99,7 @@
               <button type="button" class="btn small" id="hist-all">Select all</button>
               <button type="button" class="btn small" id="hist-none">Clear</button>
             </div>
+            <div class="hint" id="hist-count">0 selected</div>
             <hr>
             <h3>Weights</h3>
             <p class="hint">
