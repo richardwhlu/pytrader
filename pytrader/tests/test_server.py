@@ -245,3 +245,125 @@ def test_api_series_missing_ticker_reported(price_db, cfg):
         body = r.get_json()
         assert "A" in body["series"]
         assert "ZZZ" in body["missing"]
+
+
+# ---------------------------------------------------------------------
+# /api/optimize  (mean-variance basket optimizer over a date window)
+# ---------------------------------------------------------------------
+
+def test_optimize_requires_tickers(price_db, cfg):
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        assert c.get("/api/optimize").status_code == 400
+        body = c.get("/api/optimize").get_json()
+        assert "error" in body
+
+
+def test_optimize_pure_gain_puts_on_top_mover(price_db, cfg):
+    """λ=0 → 100% in A (up 30%), 0% in B (down 15%)."""
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get("/api/optimize?tickers=A,B&risk_aversion=0")
+        assert r.status_code == 200
+        body = r.get_json()
+        pts = body["points"]
+        assert len(pts) == 1
+        w = pts[0]["weights"]
+        assert w["A"] == pytest.approx(1.0, abs=1e-4)
+        assert w["B"] == pytest.approx(0.0, abs=1e-4)
+        # The basket return then equals A's window return.
+        a = price_db.load("A")
+        expected_a_ret = float(a.iloc[-1]) / float(a.iloc[0]) - 1.0
+        assert body["points"][0]["stats"]["total_return"] == pytest.approx(
+            expected_a_ret, abs=1e-6,
+        )
+
+
+def test_optimize_feasible_weights(price_db, cfg):
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        for lam in ("0", "0.5", "10", "1000"):
+            body = c.get(f"/api/optimize?tickers=A,B&risk_aversion={lam}").get_json()
+            w = body["points"][0]["weights"]
+            assert sum(w.values()) == pytest.approx(1.0, abs=1e-5)
+            assert all(v >= -1e-9 for v in w.values())
+
+
+def test_optimize_frontier_spans_tradeoff(price_db, cfg):
+    """With frontier=true we get ≥ 2 points, from pure-gain → lower-vol corner."""
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get("/api/optimize?tickers=A,B&frontier=true&steps=6")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert len(body["points"]) == 6
+        first, last = body["points"][0], body["points"][-1]
+        assert first["risk_aversion"] == 0.0
+        assert last["stats"]["ann_vol"] <= first["stats"]["ann_vol"] + 1e-9
+        # Each point independently carries a feasible weight vector.
+        for p in body["points"]:
+            assert sum(p["weights"].values()) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_optimize_slices_to_window(price_db, cfg):
+    d = price_db
+    start = d.load("A").index[10].date().isoformat()
+    end = d.load("A").index[-5].date().isoformat()
+    app = create_app(cfg=cfg, db=d)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get(f"/api/optimize?tickers=A,B&start_date={start}&end_date={end}")
+        body = r.get_json()
+        assert body["start"] >= start
+        assert body["end"] <= end
+        # n_days should be a subset of the full window's days.
+        assert 0 < body["points"][0]["stats"]["n_days"] < len(d.load("A"))
+
+
+def test_optimize_unavailable_window(price_db, cfg):
+    # Force an end_date at/before the first close → no shared window.
+    d = price_db
+    first = d.load("A").index[0].date().isoformat()
+    app = create_app(cfg=cfg, db=d)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        r = c.get(f"/api/optimize?tickers=A,B&start_date={first}&end_date={first}")
+        # 400 with a readable error (or 400 with all tickers in missing)
+        assert r.status_code == 400
+        assert "error" in r.get_json()
+
+
+def test_optimize_recommended_at_requested_lambda(price_db, cfg):
+    """When we ask for the frontier at a specific λ, `recommended` reports
+    the exact basket at that λ — even if it falls between frontier samples."""
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        for lam in ("0", "0.5", "50", "5000"):
+            r = c.get(f"/api/optimize?tickers=A,B&frontier=true"
+                      f"&steps=4&risk_aversion={lam}")
+            assert r.status_code == 200, r.get_json()
+            body = r.get_json()
+            assert "recommended" in body
+            assert body["recommended"]["risk_aversion"] == pytest.approx(
+                float(lam))
+            # recommended weights are always feasible.
+            assert sum(body["recommended"]["weights"].values()) == pytest.approx(
+                1.0, abs=1e-5)
+
+
+def test_optimize_single_point_with_steps_param_ok(price_db, cfg):
+    """The front-end always sends a `steps` param; in single-point mode the
+    server must ignore it (not reject it). A regression for a 400 that used
+    to fire when steps=1 was passed alongside a scalar risk_aversion."""
+    app = create_app(cfg=cfg, db=price_db)
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        for steps in ("1", "2", "10"):
+            r = c.get(f"/api/optimize?tickers=A,B&risk_aversion=1&steps={steps}")
+            assert r.status_code == 200, steps
+            assert len(r.get_json()["points"]) == 1

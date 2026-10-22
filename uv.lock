@@ -907,6 +907,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pyyaml" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "xgboost" },
     { name = "yfinance" },
 ]
@@ -925,6 +926,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
+    { name = "scipy", specifier = ">=1.10" },
     { name = "xgboost", specifier = ">=2.1" },
     { name = "yfinance", specifier = ">=0.2.40" },
 ]

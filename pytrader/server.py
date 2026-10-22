@@ -7,6 +7,9 @@ Routes:
   GET  /api/runs                → list of saved runs (most recent first)
   GET  /api/runs/<run_id>       → run detail + config + metrics
   GET  /api/compare?run_ids=a,b → equity + metrics side-by-side
+  GET  /api/tickers             → cached tickers (name, sector, end_date)
+  GET  /api/series              → re-indexed pct-gain series + composite
+  GET  /api/optimize            → mean-variance basket weights for a window
   POST /api/backtest            → run a new backtest with the given config
 """
 from __future__ import annotations
@@ -21,6 +24,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from pytrader import paths
 from pytrader.config import Config
+from pytrader import optimize as opt
 from pytrader.data import make_store, PriceStore
 from pytrader.feature_store import FeatureStore
 from pytrader.storage import DB, DuckDBStore
@@ -238,6 +242,145 @@ def create_app(
             "end": global_latest.date().isoformat() if global_latest else None,
             "series": out_series,
             "missing": missing,
+        })
+
+    @app.get("/api/optimize")
+    def optimize():
+        """Mean-variance basket optimizer for a historical window.
+
+        Given tickers + an optional date range, returns a single optimized
+        portfolio or the full efficient-frontier "distribution" across
+        risk-aversion values. The underlying solver is the classical
+        Markowitz reward-minus-risk problem:
+
+            maximize  w·μ  −  λ·wᵀΣw    s.t.  0 ≤ wᵢ ≤ 1,  Σwᵢ = 1
+
+        Query params:
+          tickers        (required, comma-separated)  e.g. "A,B,C"
+          start_date     (optional YYYY-MM-DD, default earliest cached)
+          end_date       (optional YYYY-MM-DD, default latest cached)
+          risk_aversion  (optional float ≥ 0; 0 = pure gain / 100 % top mover)
+          frontier       (optional "true" → return the full trade-off curve)
+          steps          (optional int ≥ 2, number of frontier points)
+
+        Response (always the same shape):
+          {
+            "objective": "return − λ·variance (daily rebalanced)",
+            "tickers": ["A", "B"],
+            "start":  "2019-11-15",
+            "end":    "2020-03-15",
+            "n":        1,                  # = len(points)
+            "points": [ {
+              "risk_aversion":  0.0,
+              "weights":        {"A": 1.0, "B": 0.0},
+              "stats": { "total_return", "ann_vol", "sharpe",
+                         "max_drawdown", "n_days", "n_positions" }
+            }, … ]
+          }
+        """
+        raw = (request.args.get("tickers") or "").split(",")
+        tickers = [t.strip().upper() for t in raw if t.strip()]
+        if not tickers:
+            return jsonify({"error": "tickers is required (comma-separated)"}), 400
+
+        start_raw = request.args.get("start_date")
+        end_raw = request.args.get("end_date")
+        try:
+            start_ts = pd.Timestamp(start_raw).normalize() if start_raw else None
+        except (ValueError, TypeError):
+            return jsonify({"error": "start_date must be YYYY-MM-DD"}), 400
+        try:
+            end_ts = pd.Timestamp(end_raw).normalize() if end_raw else None
+        except (ValueError, TypeError):
+            return jsonify({"error": "end_date must be YYYY-MM-DD"}), 400
+
+        # Parse optional risk aversion / frontier params.
+        lam_raw = request.args.get("risk_aversion")
+        lam: float | None = None
+        if lam_raw is not None:
+            try:
+                lam = float(lam_raw)
+            except ValueError:
+                return jsonify({"error": "risk_aversion must be a number"}), 400
+            if lam < 0:
+                return jsonify({"error": "risk_aversion must be ≥ 0"}), 400
+
+        want_frontier = (request.args.get("frontier") or "").lower() in ("1", "true", "yes")
+        # steps only applies to frontier mode; single-point mode ignores it,
+        # so it's only validated when we actually need it.
+        steps: int | None = None
+        if want_frontier:
+            steps_raw = request.args.get("steps")
+            if steps_raw is not None:
+                try:
+                    steps = int(steps_raw)
+                except ValueError:
+                    return jsonify({"error": "steps must be an integer ≥ 2"}), 400
+                if steps < 2:
+                    return jsonify({"error": "steps must be ≥ 2"}), 400
+
+        # Build the closes DataFrame from the cache.
+        series_map: dict[str, pd.Series] = {}
+        missing: list[str] = []
+        with _store_ctx(read_only=True) as (_, d):
+            for t in tickers:
+                s = d.load(t)
+                if s is None or len(s) == 0:
+                    missing.append(t)
+                    continue
+                if start_ts is not None:
+                    s = s.loc[s.index >= start_ts]
+                if end_ts is not None:
+                    s = s.loc[s.index <= end_ts]
+                if len(s) < 2:
+                    missing.append(t)
+                    continue
+                series_map[t] = s
+
+        kept = list(series_map.keys())
+        if len(kept) < 1:
+            return jsonify({"error": "no tickers have cached data in this window",
+                           "missing": missing}), 400
+
+        closes = pd.DataFrame(series_map)
+        all_dates = closes.dropna().index
+        if len(all_dates) < 2:
+            return jsonify({
+                "error": "the selected tickers share fewer than 2 common trading "
+                         "days in this window — widen the range",
+                "missing": missing,
+                "kept": kept,
+            }), 400
+
+        try:
+            if want_frontier:
+                result = opt.efficient_frontier(closes, steps=steps or 12)
+                if lam is not None:
+                    # Also compute the exact point at the requested λ so the
+                    # UI can show a "recommended basket" even when the slider
+                    # lands between two samples of the frontier.
+                    single = opt.optimize_window(closes, risk_aversion=lam)
+                    result["recommended"] = single.to_dict()
+            else:
+                single = opt.optimize_window(closes, risk_aversion=lam or 0.0)
+                result = {
+                    "objective": "return − λ·variance (daily rebalanced)",
+                    "n": 1,
+                    "points": [single.to_dict()],
+                    "recommended": single.to_dict(),
+                }
+        except ValueError as ve:
+            return jsonify({"error": str(ve), "missing": missing, "kept": kept}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"optimizer failed: {exc}",
+                           "missing": missing, "kept": kept}), 500
+
+        return jsonify({
+            **result,
+            "tickers": kept,
+            "missing": missing,
+            "start": all_dates[0].date().isoformat(),
+            "end":   all_dates[-1].date().isoformat(),
         })
 
     @app.get("/api/runs")

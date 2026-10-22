@@ -481,6 +481,7 @@
   /* ---------- historical re-indexed visualizer ---------- */
   let histTickers = [];            // [{ticker,name,sector,end_date}]
   let histResult = null;           // last /api/series response
+  let histWindow = null;           // last rendered {start, end} window
 
   const MSZ = (d) => Date.parse(d + "T00:00:00Z");
 
@@ -762,6 +763,248 @@
       !!missing.length);
     chartBusy(histBox, false);
     btn.disabled = false;
+
+    /* ---- post-render: wire up the optimizer for this window ----
+       The optimizer re-solves the same window that just rendered, so the
+       UI has a stable "what happened in this chart" to optimize against.
+       We capture the *exact* window used (start, end) from the payload —
+       not the form values — so if the UI later re-runs with a different
+       window, the optimizer follows along. */
+    histWindow = { start: result.start, end: result.end };
+    const rec = $("#opt-go");
+    if (rec) rec.disabled = false;
+    $("#opt-empty").classList.add("hidden");
+  }
+
+  /* ---------- optimizer (mean-variance over the current window) ----------
+     Solve max w·μ − λ·wᵀΣw for the tickers selected above, on the window
+     that just rendered. The slider maps 0–100 to a *log-scaled* λ so a
+     single sweep covers "pure gain" (left) through "fully diversified"
+     (right) without leaving huge dead zones at any end.
+
+     When the "distribution" checkbox is on we also ask for the frontier —
+     a small table of sample points so the user can see the tradeoff curve
+     they're picking on. */
+  const _OPT = {
+    // Slider → λ on a log scale. 0 (leftmost) is the literal 0.0 so the
+    // "pure gain" endpoint is exactly reproducible. Values 1–100 span
+    // roughly 3 orders of magnitude (≈ 0.01 to ≈ 1000), which covers
+    // realistic daily-var scale for equity baskets over a month.
+    slideToLam: (v) => (v <= 0 ? 0.0 : Math.pow(10, (v / 100) * 3 - 2)),
+    lamToSlide: (lam) => {
+      if (lam === 0) return 0;
+      const raw = (Math.log10(lam) + 2) / 3 * 100;
+      return Math.max(0, Math.min(100, Math.round(raw)));
+    },
+  };
+
+  async function optimizeBasket() {
+    const out = $("#opt-out");
+    const empty = $("#opt-empty");
+    const btn = $("#opt-go");
+    if (!histWindow) {
+      empty.classList.remove("hidden");
+      out.classList.add("hidden");
+      return;
+    }
+    const selected = histSelected();
+    if (!selected.length) {
+      empty.classList.remove("hidden");
+      out.classList.add("hidden");
+      return;
+    }
+    btn.disabled = true;
+    const wantFrontier = $("#opt-frontier").checked;
+    const lam = _OPT.slideToLam(Number($("#opt-risk").value));
+    const qs = new URLSearchParams({
+      tickers: selected.join(","),
+      start_date: histWindow.start || "",
+      end_date: histWindow.end || "",
+      risk_aversion: lam.toExponential(3),
+      frontier: wantFrontier ? "true" : "false",
+      steps: wantFrontier ? "10" : "1",
+    });
+    let body;
+    try {
+      body = await api(`/api/optimize?${qs.toString()}`);
+    } catch (e) {
+      empty.classList.remove("hidden");
+      empty.textContent = `Optimizer error: ${e.message || e}`;
+      out.classList.add("hidden");
+      btn.disabled = false;
+      return;
+    }
+    renderOptimize(body, lam);
+    btn.disabled = false;
+  }
+
+  function renderOptimize(body, requestedLam) {
+    const out = $("#opt-out");
+    const empty = $("#opt-empty");
+    if (!body.points || !body.points.length) return;
+    const recommended = body.recommended || body.points[0];
+
+    // Frontier canvas (only when we asked for it).
+    const frontierWrap = $("#opt-frontier-wrap");
+    const frontierCv = $("#opt-frontier");
+    if (frontierWrap && body.points.length > 1) {
+      frontierWrap.classList.remove("hidden");
+      drawFrontier(frontierCv, body.points);
+      // Frontier sample list: λ, ret, vol, top 2 by weight.
+      const ul = $("#opt-frontier-list");
+      ul.innerHTML = "";
+      for (const p of body.points) {
+        const top = Object.entries(p.weights)
+          .sort((a, b) => b[1] - a[1]).slice(0, 2);
+        const li = document.createElement("li");
+        li.append(
+          el("span", "opt-f-lam", `λ=${p.risk_aversion < 1 ? p.risk_aversion.toFixed(3) : p.risk_aversion.toFixed(1)}`),
+          el("span", "opt-f-vol", `${(p.stats.ann_vol * 100).toFixed(1)}% vol`),
+          el("span", "opt-f-ret", `${fmtPctSigned(p.stats.total_return * 100)}`),
+          el("span", "opt-f-top", top.map(([t, w]) => `${t} ${(w*100).toFixed(0)}%`).join(", ")),
+        );
+        ul.append(li);
+      }
+    } else if (frontierWrap) {
+      frontierWrap.classList.add("hidden");
+    }
+
+    // Recommended basket table.
+    const tbody = $("#opt-table-body");
+    tbody.innerHTML = "";
+    const weights = Object.entries(recommended.weights)
+      .sort((a, b) => b[1] - a[1]);
+    const total = recommended.stats.total_return;
+    for (const [t, w] of weights) {
+      const contrib = w * total;
+      const tr = document.createElement("tr");
+      tr.append(
+        el("td", "ticker", t),
+        el("td", "num", w.toFixed(3)),
+        el("td", "num " + (contrib >= 0 ? "up" : "down"),
+           fmtPctSigned(contrib * 100)),
+      );
+      tbody.append(tr);
+    }
+
+    // Stat block.
+    const stats = $("#opt-stats");
+    const s = recommended.stats;
+    stats.innerHTML = "";
+    const pairs = [
+      ["Return", fmtPctSigned(s.total_return * 100)],
+      ["Ann vol",    (s.ann_vol * 100).toFixed(1) + "%"],
+      ["Sharpe",     (Number.isFinite(s.sharpe) ? s.sharpe.toFixed(2) : "–")],
+      ["Max DD",     (s.max_drawdown * 100).toFixed(1) + "%"],
+      ["Positions",  String(s.n_positions)],
+      ["Days",       String(s.n_days)],
+    ];
+    for (const [k, v] of pairs) {
+      const d = el("div", "opt-stat");
+      d.append(el("div", "opt-stat-k", k), el("div", "opt-stat-v", v));
+      stats.append(d);
+    }
+
+    out.classList.remove("hidden");
+    empty.classList.add("hidden");
+  }
+
+  // Draw the gain↔vol trade-off scatter. x = annualised vol (lower is
+  // "smoother"), y = total return over the window. One dot per frontier
+  // sample, coloured by slider proximity to the requested λ. The pure-gain
+  // corner (λ=0) is highlighted with a ring. This is the "distribution"
+  // the user asked for — see how much gain you're trading to buy smoothness.
+  function drawFrontier(canvas, points) {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 420;
+    const cssH = canvas.clientHeight || 220;
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    const pad = { l: 56, r: 16, t: 16, b: 40 };
+    const xs = points.map((p) => p.stats.ann_vol);
+    const ys = points.map((p) => p.stats.total_return);
+    let xMin = Math.min(...xs), xMax = Math.max(...xs);
+    let yMin = Math.min(...ys), yMax = Math.max(...ys);
+    if (xMax - xMin < 1e-9) { xMin -= 0.01; xMax += 0.01; }
+    if (yMax - yMin < 1e-9) { yMin -= 0.01; yMax += 0.01; }
+    const px = (x) => pad.l + (x - xMin) / (xMax - xMin) * (cssW - pad.l - pad.r);
+    const py = (y) => pad.t + (1 - (y - yMin) / (yMax - yMin)) * (cssH - pad.t - pad.b);
+
+    ctx.clearRect(0, 0, cssW, cssH);
+    // Axis frames.
+    ctx.strokeStyle = "rgba(255,255,255,0.10)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, cssH - pad.b);
+    ctx.lineTo(cssW - pad.r, cssH - pad.b);
+    ctx.stroke();
+
+    // A few ticks.
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "10px -apple-system, system-ui, sans-serif";
+    const xTicks = 4;
+    for (let i = 0; i <= xTicks; i++) {
+      const v = xMin + (xMax - xMin) * (i / xTicks);
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fillText(`${(v * 100).toFixed(0)}%`, px(v) - 8, cssH - pad.b + 14);
+    }
+    const yTicks = 4;
+    for (let i = 0; i <= yTicks; i++) {
+      const v = yMin + (yMax - yMin) * (i / yTicks);
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.textAlign = "right";
+      ctx.fillText(`${(v * 100).toFixed(0)}%`, pad.l - 6, py(v) + 3);
+      ctx.textAlign = "left";
+    }
+
+    // Curve.
+    ctx.strokeStyle = "rgba(86,189,232,0.55)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < points.length; i++) {
+      const x = px(points[i].stats.ann_vol);
+      const y = py(points[i].stats.total_return);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Dots.
+    for (const p of points) {
+      const x = px(p.stats.ann_vol);
+      const y = py(p.stats.total_return);
+      ctx.fillStyle = p.risk_aversion === 0 ? "#f59e0b" : "#4f8cff";
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      if (p.risk_aversion === 0) {
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function bindOptimizer() {
+    const slider = $("#opt-risk");
+    const readout = $("#opt-risk-val");
+    const lamReadout = () => {
+      if (!readout) return;
+      const lam = _OPT.slideToLam(Number(slider.value));
+      readout.textContent = lam === 0 ? "0 (pure gain)"
+        : lam < 1 ? lam.toFixed(3)
+        : lam < 100 ? lam.toFixed(1)
+        : String(lam);
+    };
+    slider.addEventListener("input", lamReadout);
+    lamReadout();
+    $("#opt-go").addEventListener("click", optimizeBasket);
+    $("#opt-frontier").addEventListener("change", () => {
+      // Toggle frontier-only mode live (no refetch yet).
+    });
   }
 
   function bindHistorical() {
@@ -821,6 +1064,7 @@
     bindForm();
     loadUniverse();
     bindHistorical();
+    bindOptimizer();
     loadHistTickers();
     await loadRuns();
     window.addEventListener(
