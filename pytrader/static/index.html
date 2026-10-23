@@ -111,6 +111,18 @@
                       spellcheck="false"></textarea>
 
             <hr>
+            <h3>Benchmark</h3>
+            <p class="hint">
+              A reference line to compare the basket and the optimizer against —
+              it is <em>not</em> part of the basket or a weight. (This replaces
+              having <code>SPY</code> as a selectable ticker.)
+            </p>
+            <div class="field">
+              <label for="hist-benchmark">Benchmark ticker</label>
+              <select id="hist-benchmark" class="tk-select"></select>
+            </div>
+
+            <hr>
             <h3>Window</h3>
             <div class="form-grid">
               <div class="field span2">
@@ -188,7 +200,7 @@
               <div id="opt-out" class="hidden">
                 <div id="opt-frontier-wrap" class="opt-frontier-wrap">
                   <h4>Distribution — return vs volatility across risk levels</h4>
-                  <canvas id="opt-frontier" aria-label="Efficient frontier"></canvas>
+                  <canvas id="opt-frontier-cv" aria-label="Efficient frontier"></canvas>
                   <ul id="opt-frontier-list"></ul>
                 </div>
                 <div class="opt-rec">
@@ -206,6 +218,17 @@
                     </table>
                   </div>
                   <div class="opt-stats" id="opt-stats"></div>
+                </div>
+                <div class="opt-compare">
+                  <h4>Return — basket vs benchmark</h4>
+                  <p class="hint">
+                    Compare the optimized basket's window return against your
+                    hand-picked basket and the benchmark. The optimized basket
+                    uses the weights above; the naive basket uses your Weights
+                    box; the benchmark is the ticker chosen in the Benchmark
+                    section.
+                  </p>
+                  <div id="opt-compare-val"></div>
                 </div>
               </div>
             </div>
