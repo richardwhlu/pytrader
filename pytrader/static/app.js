@@ -913,12 +913,16 @@
   const _OPT = {
     // Slider → λ on a log scale. 0 (leftmost) is the literal 0.0 so the
     // "pure gain" endpoint is exactly reproducible. Values 1–100 span
-    // roughly 3 orders of magnitude (≈ 0.01 to ≈ 1000), which covers
-    // realistic daily-var scale for equity baskets over a month.
-    slideToLam: (v) => (v <= 0 ? 0.0 : Math.pow(10, (v / 100) * 3 - 2)),
+    // 6 orders of magnitude (≈ 0.1 to ≈ 100,000): meaningful weight
+    // spreads across a basket typically need λ in the tens-to-thousands
+    // (the min-variance corner sits at λ ≈ 1/(2·min_daily_var), which is
+    // ≈ thousands for typical equity baskets) — so the mid-point (v=50)
+    // maps to λ=100 and the right end comfortably overshoots
+    // min-variance, where the weights stop moving.
+    slideToLam: (v) => (v <= 0 ? 0.0 : Math.pow(10, (v / 100) * 6 - 1)),
     lamToSlide: (lam) => {
       if (lam === 0) return 0;
-      const raw = (Math.log10(lam) + 2) / 3 * 100;
+      const raw = (Math.log10(lam) + 1) / 6 * 100;
       return Math.max(0, Math.min(100, Math.round(raw)));
     },
   };
@@ -1178,7 +1182,7 @@
       readout.textContent = lam === 0 ? "0 (pure gain)"
         : lam < 1 ? lam.toFixed(3)
         : lam < 100 ? lam.toFixed(1)
-        : String(lam);
+        : Math.round(lam).toLocaleString();
     };
     slider.addEventListener("input", () => {
       lamReadout();
