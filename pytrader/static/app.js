@@ -187,12 +187,16 @@
       ctx.strokeStyle = s.color;
       ctx.lineWidth = 2;
       ctx.lineJoin = "round";
+      ctx.setLineDash(s.dash ? [7, 5] : []);
+      ctx.globalAlpha = s.dim ? 0.8 : 1;
       ctx.beginPath();
       ctx.moveTo(xOf(pts[0].t), yOf(pts[0].v));
       for (let i = 1; i < pts.length; i++) {
         ctx.lineTo(xOf(pts[i].t), yOf(pts[i].v));
       }
       ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -480,8 +484,14 @@
 
   /* ---------- historical re-indexed visualizer ---------- */
   let histTickers = [];            // [{ticker,name,sector,end_date}]
-  let histResult = null;           // last /api/series response
+  let histResult = null;           // last /api/series response (basket + benchmark)
   let histWindow = null;           // last rendered {start, end} window
+  // Optimizer + benchmark state, all derived from the current window:
+  let optCurve = null;             // [{risk_aversion, weights, stats, ...}] — full efficient frontier
+  let optCurveKey = null;          // dedup cache key (basket | start | end)
+  let optPreLoad = null;           // in-flight /api/optimize precompute (dedup)
+  let histBench = null;            // { ticker, name, pct, series } — benchmark in current window
+  let histNaivePct = null;         // window return (%) of the hand-picked basket
 
   const MSZ = (d) => Date.parse(d + "T00:00:00Z");
 
@@ -542,6 +552,82 @@
     return `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`;
   }
 
+  /* ---------- benchmark + optimizer precompute helpers ----------
+     The slider maps 0–100 to a log-scaled λ (see _OPT below). For instant
+     updates we PRE-COMPUTE the whole efficient frontier once per
+     (basket, window) and cache it; moving the slider then just picks the
+     nearest cached point — no network, no re-optimisation. The "Show
+     distribution" checkbox controls whether the curve is drawn. */
+  function optKey(tickers, start, end) {
+    return [tickers.slice().sort().join(","), start || "", end || ""].join("|");
+  }
+
+  function nearestPoint(points, lam) {
+    if (lam === 0) {
+      const z = points.find((p) => p.risk_aversion === 0);
+      if (z) return z;
+    }
+    let best = points[0], bestDist = Infinity;
+    const t = Math.log10(lam);
+    for (const p of points) {
+      const d = Math.abs(Math.log10(p.risk_aversion) - t);
+      if (d < bestDist) { bestDist = d; best = p; }
+    }
+    return best;
+  }
+
+  // --- Benchmark helpers (item #5: SPY etc. move from the ticker list to a
+  // dedicated "Benchmark" section so the user can compare without holding it) ---
+  function currentBenchmark() {
+    const sel = $("#hist-benchmark");
+    return sel && sel.value ? sel.value : "";
+  }
+
+  function populateBenchmarkSelect(tickers) {
+    const sel = $("#hist-benchmark");
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    const emptyOpt = document.createElement("option");
+    emptyOpt.value = "";
+    emptyOpt.textContent = "(none)";
+    sel.append(emptyOpt);
+    for (const t of tickers) {
+      const opt = document.createElement("option");
+      opt.value = t.ticker;
+      opt.textContent = t.name ? `${t.ticker} — ${t.name}` : t.ticker;
+      sel.append(opt);
+    }
+    if (prev && tickers.some((t) => t.ticker === prev)) {
+      sel.value = prev;
+    } else if (tickers.some((t) => t.ticker === "SPY")) {
+      sel.value = "SPY";
+    }
+  }
+
+  // Precompute the full frontier for the current basket + window (cached).
+  async function ensureFrontier(selected) {
+    const key = optKey(selected, histWindow.start, histWindow.end);
+    if (optCurve && optCurveKey === key) return optCurve;
+    if (optPreLoad && optPreLoad.key === key) return optPreLoad.promise;
+    const qs = new URLSearchParams({
+      tickers: selected.join(","),
+      start_date: histWindow.start || "",
+      end_date: histWindow.end || "",
+      frontier: "true",
+      steps: "32",
+    });
+    const promise = api(`/api/optimize?${qs.toString()}`)
+      .then((body) => {
+        const pts = (body.points || []).slice().sort((a, b) => a.risk_aversion - b.risk_aversion);
+        optCurve = pts; optCurveKey = key; optPreLoad = null;
+        return pts;
+      })
+      .catch((e) => { optPreLoad = null; throw e; });
+    optPreLoad = { key, promise };
+    return promise;
+  }
+
   async function loadHistTickers() {
     const list = $("#hist-ticker-list");
     const noCache = $("#hist-no-cache");
@@ -553,7 +639,15 @@
         a.ticker < b.ticker ? -1 : 1);
       if (!histTickers.length) { noCache.classList.remove("hidden"); return; }
       noCache.classList.add("hidden");
-      for (const t of histTickers) {
+      // Populate the benchmark <select>.
+      populateBenchmarkSelect(histTickers);
+      // Exclude the benchmark from the basket list so it can't be held
+      // twice (once as a basket position, once as a reference line).
+      const bench = currentBenchmark();
+      const toRender = bench
+        ? histTickers.filter((t) => t.ticker !== bench)
+        : histTickers;
+      for (const t of toRender) {
         const row = el("label", "hist-row");
         const cb = document.createElement("input");
         cb.type = "checkbox"; cb.value = t.ticker;
@@ -642,13 +736,19 @@
     if (!selected.length) { setStatus(status, "Pick at least one ticker.", true); return; }
     const start = $("#hist-start").value;
     const horizon = parseInt($("#hist-horizon").value, 10) || 0;
+    // Include the benchmark in the same /api/series call (free — the server
+    // just returns one extra series). It is treated as a reference line, not
+    // a held position.
+    const bench = currentBenchmark();
+    const requested = (bench && !selected.includes(bench))
+      ? [...selected, bench] : selected.slice();
     btn.disabled = true;
     const histBox = $("#hist-chart").parentElement;
-    setStatus(status, `Computing ${selected.length} series…`, false, true);
-    chartBusy(histBox, true, `Re-indexing ${selected.length} series…`);
+    setStatus(status, `Computing ${requested.length} series…`, false, true);
+    chartBusy(histBox, true, `Re-indexing ${requested.length} series…`);
     let result;
     try {
-      const qs = new URLSearchParams({ tickers: selected.join(",") });
+      const qs = new URLSearchParams({ tickers: requested.join(",") });
       if (start) qs.set("start_date", start);
       if (horizon > 0) qs.set("horizon", String(horizon));
       result = await api(`/api/series?${qs.toString()}`);
@@ -661,7 +761,19 @@
     btn.disabled = false; // re-enable early; the render below is synchronous & fast
     try {
       histResult = result;
+      // Capture the benchmark (reference line) if present.
+      if (bench && result.series && result.series[bench]) {
+        const b = result.series[bench];
+        histBench = { ticker: bench, name: b.name, pct: b.end_pct, series: b };
+      } else {
+        histBench = null;
+      }
       await renderHist(result);
+      // Feature #3: precompute the optimizer frontier in the background so
+      // the slider is instant on first interaction (no visible wait).
+      if (histWindow) {
+        ensureFrontier(selected).catch(() => {});
+      }
     } catch (e) {
       // A render-stage throw (e.g. a chart bug) used to escape all the way up,
       // leaving the spinner up and the button disabled — which looked like an
@@ -697,6 +809,16 @@
         label: "COMPOSITE",
         color: "#f5f7fa",
         points: composite.map(([d, v]) => ({ t: MSZ(d), v })),
+      });
+    }
+    // Benchmark reference line (dashed) if one was chosen.
+    if (histBench && histBench.series && histBench.series.points) {
+      seriesList.push({
+        label: histBench.ticker + " (benchmark)",
+        color: "#94a3b8",
+        dash: true,
+        dim: true,
+        points: histBench.series.points.map(([d, v]) => ({ t: MSZ(d), v })),
       });
     }
     $("#hist-chart-empty").classList.add("hidden");
@@ -755,6 +877,9 @@
       tot.textContent = "–";
       tot.className = "big";
     }
+    // Remember the naive (hand-picked) basket return for the optimizer comparison.
+    histNaivePct = (composite && composite.length)
+      ? composite[composite.length - 1][1] : null;
 
     setStatus(status,
       `${avail.length}/${selected.length} plotted` +
@@ -798,6 +923,13 @@
     },
   };
 
+  // Feature #3: the whole efficient frontier is precomputed once per
+  // (basket, window) — usually in the background right after the chart
+  // renders — and cached in `optCurve`. "Optimize" then only picks the
+  // nearest cached point; moving the slider afterwards re-renders
+  // instantly with zero network traffic. Falls back to a fresh API call
+  // if the background precompute never happened (e.g. user hit Optimize
+  // before generation finished, or the cache keys changed).
   async function optimizeBasket() {
     const out = $("#opt-out");
     const empty = $("#opt-empty");
@@ -813,43 +945,56 @@
       out.classList.add("hidden");
       return;
     }
-    btn.disabled = true;
-    const wantFrontier = $("#opt-frontier").checked;
     const lam = _OPT.slideToLam(Number($("#opt-risk").value));
-    const qs = new URLSearchParams({
-      tickers: selected.join(","),
-      start_date: histWindow.start || "",
-      end_date: histWindow.end || "",
-      risk_aversion: lam.toExponential(3),
-      frontier: wantFrontier ? "true" : "false",
-      steps: wantFrontier ? "10" : "1",
-    });
-    let body;
+    btn.disabled = true;
     try {
-      body = await api(`/api/optimize?${qs.toString()}`);
+      const curve = await ensureFrontier(selected);
+      if (!curve || !curve.length) throw new Error("optimizer returned no points");
+      // If the basket changed since the last render, refresh the cached
+      // curve key so live slider moves stay consistent.
+      renderOptimize({ points: curve }, lam);
     } catch (e) {
       empty.classList.remove("hidden");
       empty.textContent = `Optimizer error: ${e.message || e}`;
       out.classList.add("hidden");
+    } finally {
       btn.disabled = false;
-      return;
     }
-    renderOptimize(body, lam);
-    btn.disabled = false;
+  }
+
+  // Re-render from the precomputed curve (or fetch it first). This is what
+  // the slider calls on every input event — so it must work even if the
+  // background precompute is still in flight: ensureFrontier dedups the
+  // request, and the button gets unlocked in a `finally`.
+  async function updateFromCurve() {
+    if (!histWindow) return;
+    const selected = histSelected();
+    if (!selected.length) return;
+    const lam = _OPT.slideToLam(Number($("#opt-risk").value));
+    try {
+      const curve = await ensureFrontier(selected);
+      if (curve && curve.length) renderOptimize({ points: curve }, lam);
+    } catch (e) {
+      // A precompute failure shouldn't wedge the slider; the button path
+      // surfaces the same error for the user to read.
+      console.error("optimizer precompute failed", e);
+    }
   }
 
   function renderOptimize(body, requestedLam) {
     const out = $("#opt-out");
     const empty = $("#opt-empty");
     if (!body.points || !body.points.length) return;
-    const recommended = body.recommended || body.points[0];
+    const recommended = body.recommended || nearestPoint(body.points, requestedLam);
 
-    // Frontier canvas (only when we asked for it).
+    // Frontier canvas (only when the checkbox is on).
     const frontierWrap = $("#opt-frontier-wrap");
-    const frontierCv = $("#opt-frontier");
-    if (frontierWrap && body.points.length > 1) {
+    const frontierCv = $("#opt-frontier-cv");
+    if (frontierWrap && !$("#opt-frontier").checked) {
+      frontierWrap.classList.add("hidden");
+    } else if (frontierWrap && body.points.length > 1) {
       frontierWrap.classList.remove("hidden");
-      drawFrontier(frontierCv, body.points);
+      drawFrontier(frontierCv, body.points, recommended);
       // Frontier sample list: λ, ret, vol, top 2 by weight.
       const ul = $("#opt-frontier-list");
       ul.innerHTML = "";
@@ -865,8 +1010,6 @@
         );
         ul.append(li);
       }
-    } else if (frontierWrap) {
-      frontierWrap.classList.add("hidden");
     }
 
     // Recommended basket table.
@@ -905,16 +1048,45 @@
       stats.append(d);
     }
 
+    // Feature #4 + #5: side-by-side window returns — hand-picked basket
+    // (the % shown by the Weights box chart), optimized basket (this
+    // recommended point), and the benchmark reference line (if one is
+    // selected). `histNaivePct` / `histBench` are plain percentages;
+    // `stats.total_return` is a fraction.
+    const cmp = $("#opt-compare-val");
+    if (cmp) {
+      const rows = [];
+      if (Number.isFinite(histNaivePct)) {
+        rows.push(["Naive basket (your weights)", histNaivePct]);
+      }
+      rows.push(["Optimized basket (this point)", s.total_return * 100]);
+      if (histBench && Number.isFinite(histBench.pct)) {
+        rows.push([`${histBench.ticker} (benchmark)`, histBench.pct]);
+      } else {
+        rows.push(["Benchmark", null]);
+      }
+      cmp.innerHTML = "";
+      for (const [label, pct] of rows) {
+        const div = el("div", "opt-compare-row");
+        const val = pct === null
+          ? el("span", "opt-compare-pct muted", "not selected")
+          : el("span", "opt-compare-pct " + (pct >= 0 ? "up" : "down"),
+               fmtPctSigned(pct));
+        div.append(el("span", "opt-compare-label", label), val);
+        cmp.append(div);
+      }
+    }
+
     out.classList.remove("hidden");
     empty.classList.add("hidden");
   }
 
   // Draw the gain↔vol trade-off scatter. x = annualised vol (lower is
   // "smoother"), y = total return over the window. One dot per frontier
-  // sample, coloured by slider proximity to the requested λ. The pure-gain
-  // corner (λ=0) is highlighted with a ring. This is the "distribution"
-  // the user asked for — see how much gain you're trading to buy smoothness.
-  function drawFrontier(canvas, points) {
+  // sample, with the active point — the one nearestPoint() picked for the
+  // current slider — highlighted with a ring. This is the "distribution"
+  // the user asked for: see how much gain you're trading to buy smoothness.
+  function drawFrontier(canvas, points, activePt = null) {
     const dpr = window.devicePixelRatio || 1;
     const cssW = canvas.clientWidth || 420;
     const cssH = canvas.clientHeight || 220;
@@ -970,24 +1142,33 @@
     }
     ctx.stroke();
 
-    // Dots.
+    // Dots; the active point (the one the slider currently selects) is
+    // highlighted with a ring.
     for (const p of points) {
       const x = px(p.stats.ann_vol);
       const y = py(p.stats.total_return);
-      ctx.fillStyle = p.risk_aversion === 0 ? "#f59e0b" : "#4f8cff";
+      const isActive = activePt && activePt.risk_aversion === p.risk_aversion
+                       && Object.is(activePt, p);
+      ctx.fillStyle = p.risk_aversion === 0 ? "#f59e0b"
+                   : isActive ? "#f59e0b" : "#4f8cff";
       ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.arc(x, y, isActive ? 4 : 3, 0, Math.PI * 2);
       ctx.fill();
-      if (p.risk_aversion === 0) {
-        ctx.strokeStyle = "#f59e0b";
+      if (isActive || p.risk_aversion === 0) {
+        ctx.strokeStyle = p.risk_aversion === 0 ? "#f59e0b" : "#f59e0b";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.arc(x, y, 7, 0, Math.PI * 2);
         ctx.stroke();
       }
     }
   }
 
+  // Feature #3: moving the slider live-re-renders the output from the
+  // precomputed frontier — no network call after the first render (and
+  // not even that, since generateHist precomputes it in the background).
+  // The "Optimize" button still works as a full (re)fetch in case the
+  // cache went stale or the basket changed.
   function bindOptimizer() {
     const slider = $("#opt-risk");
     const readout = $("#opt-risk-val");
@@ -999,11 +1180,20 @@
         : lam < 100 ? lam.toFixed(1)
         : String(lam);
     };
-    slider.addEventListener("input", lamReadout);
+    slider.addEventListener("input", () => {
+      lamReadout();
+      if (histWindow && histSelected().length) updateFromCurve(); // instant re-render from cache
+    });
     lamReadout();
     $("#opt-go").addEventListener("click", optimizeBasket);
+    // "Show distribution" toggles the frontier panel visibility live —
+    // no re-compute needed since the curve is already cached in optCurve;
+    // re-render just re-runs renderOptimize (which reads the checkbox).
     $("#opt-frontier").addEventListener("change", () => {
-      // Toggle frontier-only mode live (no refetch yet).
+      if (!$("#opt-out").classList.contains("hidden") && optCurve && optCurve.length) {
+        const lam = _OPT.slideToLam(Number($("#opt-risk").value));
+        renderOptimize({ points: optCurve }, lam);
+      }
     });
   }
 
